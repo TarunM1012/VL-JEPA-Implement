@@ -393,8 +393,8 @@ if __name__ == "__main__":
 
     # (batch=1, frames=2, patches=196, visual_dim=1024)
     # 196 = (224/16)^2 — standard ViT-L/16 patch count at 224 px
-    B, F, P, D = 1, 2, 196, _VISUAL_DIM
-    visual_embeds = torch.randn(B, F, P, D)
+    B, num_frames, P, D = 1, 2, 196, _VISUAL_DIM
+    visual_embeds = torch.randn(B, num_frames, P, D)
     texts         = ["What is happening in the video?"]
 
     print(f"Visual input : {tuple(visual_embeds.shape)}")

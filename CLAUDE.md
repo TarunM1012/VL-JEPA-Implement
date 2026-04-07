@@ -31,21 +31,27 @@ python scripts/train.py
 
 The model has four components that are built and tested independently:
 
-| Component | File | Role |
-|---|---|---|
-| X-Encoder | `models/visual_encoder.py` | Encodes context frames; frozen V-JEPA 2 with ViT fallback |
-| Y-Encoder | `models/visual_encoder.py` | Frozen encoder for target frames |
-| Language Encoder | `models/language_encoder.py` | LLaMA 3 transformer layers for text conditioning |
-| Predictor | `models/predictor.py` | Predicts Y-encoder output from X-encoder + language features |
+| Component | File | Status | Role |
+|---|---|---|---|
+| X-Encoder | `models/visual_encoder.py` | ✅ Done | Encodes context frames; frozen V-JEPA 2 with ViT-L/16 timm fallback |
+| Y-Encoder | `models/y_encoder.py` | ✅ Done | Frozen EmbeddingGemma-300M backbone + trainable Linear(hidden→1536) head; L2-normalised output |
+| Predictor | `models/predictor.py` | ✅ Done | LLaMA 3.2-1B layers 8–15 (≈490M); bidirectional attention; fuses visual patches + text query; L2-normalised 1536-dim output |
+| Language Encoder | `models/language_encoder.py` | ⬜ Todo | LLaMA 3 transformer layers for text conditioning |
 
-**Loss** (`models/loss.py`): prediction loss + anti-collapse regularization.
+**Loss** (`models/loss.py`): prediction loss + anti-collapse regularization. ⬜ Todo
 
-**Training** (`scripts/train.py`): main training loop.
+**Training** (`scripts/train.py`): main training loop. ⬜ Todo
 
 **Config** (`configs/base.yaml`): YAML-based model and training hyperparameters, loaded via PyYAML.
 
 **Experiment tracking**: Weights & Biases (`wandb`).
 
+## Key implementation details
+
+- **VisualEncoder** (`visual_encoder.py`): V-JEPA 2 strips CLS token, returns `(B, F, num_patches, 1024)`. Timm fallback encodes frames independently.
+- **YEncoder** (`y_encoder.py`): EmbeddingGemma-300M frozen; attention-mask-weighted mean pool; `Linear(hidden→1536, bias=False)`; projection head uses 5% of base LR.
+- **Predictor** (`predictor.py`): Extracts `llama.model.layers[8:16]` + `embed_tokens` (frozen) + `norm` + `rotary_emb`. Visual tokens prepended to text tokens. Bidirectional mask: additive 4-D `(B,1,1,S)` with −inf on padding columns, no causal triangle. `attn_implementation="eager"` avoids SDPA `cache_position` requirement. `_pass_position_embeddings` flag probed at init for transformers ≥ 4.45 compatibility.
+
 ## Development approach
 
-Build one component at a time and test it before moving on. The current branch `visual-encoder` is implementing the visual encoder module.
+Build one component at a time and test it before moving on. Current branch: `predictor`.

@@ -169,7 +169,8 @@ class Predictor(nn.Module):
 
         llama = AutoModelForCausalLM.from_pretrained(
             _HF_MODEL_ID,
-            attn_implementation="eager",  # see docstring
+            attn_implementation="eager",
+            torch_dtype=torch.float32,  # see docstring
         )
 
         llama_model = llama.model

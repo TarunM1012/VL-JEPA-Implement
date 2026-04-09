@@ -34,7 +34,6 @@ Head        : Linear(2048, 1536, bias=False) → L2-normalise
 Output      : (batch, 1536) in the shared visual–language embedding space
 """
 
-import inspect
 import logging
 from typing import List, Optional
 
@@ -117,26 +116,12 @@ class Predictor(nn.Module):
         # same reason as visual_proj.
         self.projection_head = nn.Linear(hidden_size, _SHARED_DIM, bias=False)
 
-        # --- API-version probe -------------------------------------------
-        # Newer transformers (≥ 4.45) moved rotary-embedding computation out
-        # of each layer and expect (cos, sin) to be pre-computed and passed
-        # via the position_embeddings argument.  We inspect the first layer's
-        # signature once at construction so the forward pass doesn't repeat
-        # this check every call.
-        self._pass_position_embeddings = (
-            "position_embeddings" in inspect.signature(
-                self.llama_layers[0].forward
-            ).parameters
-        )
-
         logger.info(
-            "Predictor: %d LLaMA layers | hidden=%d | visual_proj %d→%d | head %d→%d"
-            " | pass_position_embeddings=%s",
+            "Predictor: %d LLaMA layers | hidden=%d | visual_proj %d→%d | head %d→%d",
             len(self.llama_layers),
             hidden_size,
             _VISUAL_DIM, hidden_size,
             hidden_size, _SHARED_DIM,
-            self._pass_position_embeddings,
         )
 
     # ------------------------------------------------------------------
@@ -332,16 +317,6 @@ class Predictor(nn.Module):
             .expand(B, -1)
         )                                                             # (B, S)
 
-        # ---- Pre-compute rotary embeddings (if supported) ----------------
-        # Modern transformers compute (cos, sin) tensors once and pass them
-        # into every layer.  Older versions compute them inside each layer.
-        # We detected at construction time which API this checkpoint uses.
-        if self._pass_position_embeddings and self.rotary_emb is not None:
-            cos, sin = self.rotary_emb(hidden, position_ids)
-            position_embeddings = (cos[:, :seq_len], sin[:, :seq_len])
-        else:
-            position_embeddings = None
-
         # ---- Transformer pass --------------------------------------------
         for layer in self.llama_layers:
             kwargs: dict = dict(
@@ -349,9 +324,6 @@ class Predictor(nn.Module):
                 position_ids=position_ids,
                 use_cache=False,
             )
-            if position_embeddings is not None:
-                kwargs["position_embeddings"] = position_embeddings
-
             out    = layer(hidden, **kwargs)
             hidden = out[0]                                          # (B, S, 2048)
 

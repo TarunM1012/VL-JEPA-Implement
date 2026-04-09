@@ -337,7 +337,8 @@ class Predictor(nn.Module):
         # into every layer.  Older versions compute them inside each layer.
         # We detected at construction time which API this checkpoint uses.
         if self._pass_position_embeddings and self.rotary_emb is not None:
-            position_embeddings = self.rotary_emb(hidden, position_ids)  # (cos, sin)
+            cos, sin = self.rotary_emb(hidden, position_ids)
+            position_embeddings = (cos[:, :seq_len], sin[:, :seq_len])
         else:
             position_embeddings = None
 

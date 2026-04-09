@@ -155,7 +155,7 @@ class Predictor(nn.Module):
         llama = AutoModelForCausalLM.from_pretrained(
             _HF_MODEL_ID,
             attn_implementation="eager",
-            torch_dtype=torch.float32,  # see docstring
+            dtype=torch.float32,
         )
 
         llama_model = llama.model
@@ -317,11 +317,15 @@ class Predictor(nn.Module):
             .expand(B, -1)
         )                                                             # (B, S)
 
+        # ---- Pre-compute rotary embeddings -------------------------------
+        position_embeddings = self.rotary_emb(hidden, position_ids)
+
         # ---- Transformer pass --------------------------------------------
         for layer in self.llama_layers:
             kwargs: dict = dict(
                 attention_mask=attn_mask_4d,
                 position_ids=position_ids,
+                position_embeddings=position_embeddings,
                 use_cache=False,
             )
             out    = layer(hidden, **kwargs)

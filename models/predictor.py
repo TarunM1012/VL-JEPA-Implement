@@ -316,15 +316,8 @@ class Predictor(nn.Module):
             .unsqueeze(0)
             .expand(B, -1)
         )                                                             # (B, S)
-
         # ---- Pre-compute rotary embeddings -------------------------------
-        # Some transformers versions return cos/sin of shape (..., head_dim//2)
-        # while the position_embeddings API expects full head_dim.  Expand if needed.
         cos, sin = self.rotary_emb(hidden, position_ids)
-        head_dim = self.llama_layers[0].self_attn.head_dim
-        if cos.shape[-1] == head_dim // 2:
-            cos = torch.cat([cos, cos], dim=-1)
-            sin = torch.cat([sin, sin], dim=-1)
         position_embeddings = (cos, sin)
 
         # ---- Transformer pass --------------------------------------------

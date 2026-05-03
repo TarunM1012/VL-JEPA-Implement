@@ -318,7 +318,8 @@ class Predictor(nn.Module):
         )                                                             # (B, S)
         # ---- Pre-compute rotary embeddings -------------------------------
         cos, sin = self.rotary_emb(hidden, position_ids)
-        print(f"DEBUG cos: {cos.shape}, sin: {sin.shape}")
+        cos = cos[..., :cos.shape[-1] // 2]  # 64 → 32
+        sin = sin[..., :sin.shape[-1] // 2]  # 64 → 32
         position_embeddings = (cos, sin)
 
         # ---- Transformer pass --------------------------------------------

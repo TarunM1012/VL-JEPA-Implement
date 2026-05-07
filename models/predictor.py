@@ -317,9 +317,9 @@ class Predictor(nn.Module):
             .expand(B, -1)
         )                                                             # (B, S)
         # ---- Pre-compute rotary embeddings -------------------------------
+        # rotary_emb returns (B, S, head_dim) in all transformers versions;
+        # no slicing needed — the shape matches what apply_rotary_pos_emb expects.
         cos, sin = self.rotary_emb(hidden, position_ids)
-        #cos = cos[..., :cos.shape[-1] // 2]  # 64 → 32
-        #sin = sin[..., :sin.shape[-1] // 2]  # 64 → 32
         position_embeddings = (cos, sin)
 
         # ---- Transformer pass --------------------------------------------
@@ -330,8 +330,10 @@ class Predictor(nn.Module):
                 position_embeddings=position_embeddings,
                 use_cache=False,
             )
-            out    = layer(hidden, **kwargs)
-            hidden = out[0]                                          # (B, S, 2048)
+            out = layer(hidden, **kwargs)
+            # transformers ≥ 5.0 returns a bare Tensor; < 5.0 returns (Tensor,).
+            # Index only when it is a sequence to preserve the batch dimension.
+            hidden = out[0] if isinstance(out, (tuple, list)) else out  # (B, S, 2048)
 
         hidden = self.norm(hidden)                                   # (B, S, 2048)
 

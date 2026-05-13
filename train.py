@@ -49,7 +49,7 @@ def parse_args() -> argparse.Namespace:
                         help="frames per clip (MIT-States repeats the image)")
     parser.add_argument(
         "--data_root",
-        default="/scratch/tarunm10/datasets/release_dataset",
+        default="/scratch/tarunm10/datasets/release_dataset/images",
         help="root containing the 'attr obj' image subdirectories",
     )
     parser.add_argument(

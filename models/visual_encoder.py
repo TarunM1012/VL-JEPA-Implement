@@ -96,7 +96,7 @@ class VisualEncoder(nn.Module):
         if self._backend == "vjepa2":
             # V-JEPA 2 accepts (batch, frames, channels, height, width) natively.
             # last_hidden_state: (B, 1 + F*num_patches, embed_dim) — index 0 is CLS.
-            tokens = self.backbone(pixel_values=x).last_hidden_state
+            tokens = self.backbone(pixel_values_videos=x).last_hidden_state
             patch_tokens = tokens[:, 1:, :]          # strip CLS
             num_patches = patch_tokens.size(1) // F
             return patch_tokens.view(B, F, num_patches, self.embed_dim)

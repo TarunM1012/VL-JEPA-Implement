@@ -74,8 +74,8 @@ class YEncoder(nn.Module):
         """Load EmbeddingGemma-300M weights from HuggingFace Hub."""
         logger.info("YEncoder: downloading %s", _HF_MODEL_ID)
 
-        tokenizer = AutoTokenizer.from_pretrained(_HF_MODEL_ID)
-        backbone  = AutoModel.from_pretrained(_HF_MODEL_ID)
+        tokenizer = AutoTokenizer.from_pretrained(_HF_MODEL_ID, local_files_only=True)
+        backbone  = AutoModel.from_pretrained(_HF_MODEL_ID, local_files_only=True)
 
         # hidden_size is read from the config so this file stays correct even
         # if the checkpoint is swapped for a different Gemma variant.

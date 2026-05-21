@@ -146,7 +146,7 @@ class Predictor(nn.Module):
 
         logger.info("Predictor: downloading %s", _HF_MODEL_ID)
 
-        tokenizer = AutoTokenizer.from_pretrained(_HF_MODEL_ID)
+        tokenizer = AutoTokenizer.from_pretrained(_HF_MODEL_ID, local_files_only=True)
         # LLaMA's tokenizer has no dedicated pad token; use EOS as the
         # padding sentinel.  This is safe because we mask padded positions
         # out of both attention and pooling.
@@ -156,6 +156,7 @@ class Predictor(nn.Module):
             _HF_MODEL_ID,
             attn_implementation="eager",
             dtype=torch.float32,
+            local_files_only=True,
         )
 
         llama_model = llama.model

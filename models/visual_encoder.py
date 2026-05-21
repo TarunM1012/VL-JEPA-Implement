@@ -14,7 +14,7 @@ _EMBED_DIM = 1024
 def _load_vjepa2():
     """Try to load V-JEPA 2 from HuggingFace. Returns (model, backend) or raises."""
     from transformers import AutoModel
-    model = AutoModel.from_pretrained(_HF_MODEL_ID)
+    model = AutoModel.from_pretrained(_HF_MODEL_ID, local_files_only=True)
     return model, "vjepa2"
 
 

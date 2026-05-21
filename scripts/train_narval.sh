@@ -39,6 +39,8 @@ echo "Node:   $SLURMD_NODENAME"
 echo "GPU:    $CUDA_VISIBLE_DEVICES"
 echo "Start:  $(date)"
 
+export HF_DATASETS_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
 python train.py
 
 echo "End: $(date)"

@@ -39,8 +39,9 @@ echo "Node:   $SLURMD_NODENAME"
 echo "GPU:    $CUDA_VISIBLE_DEVICES"
 echo "Start:  $(date)"
 
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export HF_DATASETS_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
-python train.py
+python train.py --batch_size 32
 
 echo "End: $(date)"

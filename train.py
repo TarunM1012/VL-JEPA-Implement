@@ -190,11 +190,11 @@ def main() -> None:
     # YEncoder: EmbeddingGemma-300M backbone (frozen) + trainable projection head.
     # The backbone's forward is already wrapped in no_grad inside YEncoder.forward().
     logger.info("Loading YEncoder …")
-    y_encoder = YEncoder.load_pretrained(device=device)
+    y_encoder = YEncoder.load_pretrained(device=device).to(device)
 
     # Predictor: LLaMA 3.2-1B layers 8–15 (trainable) + frozen embed_tokens.
     logger.info("Loading Predictor …")
-    predictor = Predictor.load_pretrained(device=device)
+    predictor = Predictor.load_pretrained(device=device).to(device)
 
     # InfoNCE loss with a single learnable temperature scalar (log_inv_tau).
     loss_fn = InfoNCELoss().to(device)

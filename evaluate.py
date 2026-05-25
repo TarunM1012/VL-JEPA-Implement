@@ -76,12 +76,12 @@ def load_models(
     visual_encoder.to(device).eval()
 
     logger.info("Building YEncoder …")
-    y_encoder = YEncoder.load_pretrained(device=device)
+    y_encoder = YEncoder.load_pretrained(device=device).to(device)
     y_encoder.load_state_dict(state["y_encoder"])
     y_encoder.eval()
 
     logger.info("Building Predictor …")
-    predictor = Predictor.load_pretrained(device=device)
+    predictor = Predictor.load_pretrained(device=device).to(device)
     predictor.load_state_dict(state["predictor"])
     predictor.eval()
 

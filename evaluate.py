@@ -176,7 +176,7 @@ def main() -> None:
             # An empty text query lets visual tokens dominate; the predictor
             # then produces an embedding that should be nearest to the correct
             # pair text embedding.
-            empty_texts  = [""] * clips.size(0)
+            empty_texts = ["a photo of"] * clips.size(0)
             pred_embeds  = predictor(patch_tokens, empty_texts)  # (B, 1536), L2-normed
 
             # Step 3 — Nearest-neighbour retrieval over all pair embeddings.

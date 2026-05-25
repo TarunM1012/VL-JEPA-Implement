@@ -242,6 +242,7 @@ def main() -> None:
 
             # Step 3 — Predict target embeddings by fusing visual patch tokens
             # with the text query through bidirectional LLaMA layers.
+            queries = ["a photo of"] * len(texts)
             pred_embeds = predictor(patch_tokens, texts)   # (B, 1536), L2-normalised
 
             # Step 4 — Bidirectional InfoNCE loss.

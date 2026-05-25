@@ -4,7 +4,7 @@
 #SBATCH --gres=gpu:a100:1            # Request one A100 40GB GPU
 #SBATCH --cpus-per-task=4            # CPU cores for data loading workers
 #SBATCH --mem=40G                    # Host RAM (mirrors GPU VRAM to avoid bottleneck)
-#SBATCH --time=12:00:00              # Wall-clock limit (HH:MM:SS)
+#SBATCH --time=24:00:00              # Wall-clock limit (HH:MM:SS)
 #SBATCH --output=logs/train_%j.out   # stdout; %j expands to SLURM job ID
 #SBATCH --error=logs/train_%j.err    # stderr; kept separate for easier debugging
 
@@ -42,6 +42,6 @@ echo "Start:  $(date)"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export HF_DATASETS_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
-python train.py --batch_size 32
+python train.py --batch_size 32 --epochs 20
 
 echo "End: $(date)"

@@ -97,14 +97,21 @@ def encode_all_pairs(
     batch_size: int,
     device: torch.device,
 ) -> torch.Tensor:
-    """Return (num_pairs, 1536) L2-normalised embeddings for every pair text."""
-    texts = [f"{attr} {obj}" for attr, obj in pairs]
+    """Return (num_pairs, 1536) L2-normalised embeddings for every pair text.
+    
+    Encodes attribute and object separately and sums their embeddings to
+    encourage compositional generalization to unseen pairs.
+    """
+    import torch.nn.functional as F
+    attrs = [attr for attr, obj in pairs]
+    objs  = [obj  for attr, obj in pairs]
     chunks = []
-    for i in range(0, len(texts), batch_size):
-        chunk = y_encoder(texts[i : i + batch_size])   # (B, 1536), L2-normalised
-        chunks.append(chunk.cpu())
-    return torch.cat(chunks, dim=0)                    # (num_pairs, 1536)
-
+    for i in range(0, len(attrs), batch_size):
+        attr_chunk = y_encoder(attrs[i : i + batch_size])   # (B, 1536)
+        obj_chunk  = y_encoder(objs[i  : i + batch_size])   # (B, 1536)
+        combined   = F.normalize(attr_chunk + obj_chunk, dim=-1)  # (B, 1536)
+        chunks.append(combined.cpu())
+    return torch.cat(chunks, dim=0)                          # (num_pairs, 1536)
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 

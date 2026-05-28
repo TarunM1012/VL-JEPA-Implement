@@ -258,9 +258,9 @@ def main() -> None:
 
             if global_step % 10 == 0:
                 logger.info(
-                    "epoch=%d  step=%d  loss=%.4f  tau=%.4f",
+                    "epoch=%d  step=%d  loss=%.4f  aux=%.4f  tau=%.4f",
                     epoch + 1, global_step,
-                    loss.item(), loss_fn.tau.item(),
+                    loss.item(), aux_loss.item(), loss_fn.tau.item(),
                 )
 
             if global_step % 1000 == 0:

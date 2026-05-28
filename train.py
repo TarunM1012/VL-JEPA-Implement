@@ -215,7 +215,39 @@ def main() -> None:
             pred_embeds = predictor(patch_tokens, queries)   # (B, 1536)
 
             # Step 4 — Bidirectional InfoNCE loss
-            loss = loss_fn(pred_embeds, target_embeds)
+            #loss = loss_fn(pred_embeds, target_embeds)
+
+            #new loss
+            # ── Auxiliary compositional loss ──────────────────────────────────────
+            # For pairs in the batch that share the same attribute, pull their
+            # attr embeddings together. Same for shared objects.
+            # This forces the model to learn transferable primitive representations.
+            aux_loss = torch.tensor(0.0, device=device)
+            num_aux = 0
+
+            for i in range(len(attrs)):
+                for j in range(i + 1, len(attrs)):
+                    if attrs[i] == attrs[j]:
+                        # same attribute — embeddings should be similar
+                        aux_loss += 1 - F.cosine_similarity(
+                            attr_embeds[i].unsqueeze(0),
+                            attr_embeds[j].unsqueeze(0)
+                        )
+                        num_aux += 1
+                    if objs[i] == objs[j]:
+                        # same object — embeddings should be similar
+                        aux_loss += 1 - F.cosine_similarity(
+                            obj_embeds[i].unsqueeze(0),
+                            obj_embeds[j].unsqueeze(0)
+                        )
+                        num_aux += 1
+
+            if num_aux > 0:
+                aux_loss = aux_loss / num_aux
+
+            # Combine losses — 0.1 weight keeps aux from dominating
+            loss = loss_fn(pred_embeds, target_embeds) + 0.1 * aux_loss
+
 
             # Step 5 — Backprop
             optimizer.zero_grad()

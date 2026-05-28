@@ -232,14 +232,14 @@ def main() -> None:
                         aux_loss += 1 - F.cosine_similarity(
                             attr_embeds[i].unsqueeze(0),
                             attr_embeds[j].unsqueeze(0)
-                        )
+                        ).item()
                         num_aux += 1
                     if objs[i] == objs[j]:
                         # same object — embeddings should be similar
                         aux_loss += 1 - F.cosine_similarity(
                             obj_embeds[i].unsqueeze(0),
                             obj_embeds[j].unsqueeze(0)
-                        )
+                        ).item()
                         num_aux += 1
 
             if num_aux > 0:

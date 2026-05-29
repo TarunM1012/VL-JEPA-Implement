@@ -13,6 +13,7 @@ import argparse
 import logging
 import sys
 from pathlib import Path
+import os
 
 import torch
 import torch.nn.functional as F
@@ -61,7 +62,7 @@ def parse_args() -> argparse.Namespace:
 
 # ── Checkpoint helpers ────────────────────────────────────────────────────────
 
-CKPT_DIR = Path("checkpoints")
+CKPT_DIR = Path(os.environ.get("CHECKPOINT_DIR", "checkpoints"))
 
 
 def save_checkpoint(

@@ -6,7 +6,8 @@ Protocol
 1. Pre-compute y_encoder embeddings for every (attr, obj) pair in the vocabulary.
 2. For each test image, run visual_encoder → predictor (empty text query) to
    produce a visual prediction in the shared embedding space.
-3. Rank all pair embeddings by cosine similarity; predict the top-1 pair.
+3. Three-branch scoring following PromptCCZSL protocol: score against attr,
+   obj, and composition embeddings separately, then combine.
 4. Report seen accuracy, unseen accuracy, and harmonic mean (HM).
 
 Seen / unseen split: pairs listed in train_pairs.txt are "seen"; all other
@@ -59,6 +60,18 @@ def parse_args() -> argparse.Namespace:
         default="/scratch/tarunm10/datasets/mit-states/compositional-split-natural",
         help="dir containing train/val/test_pairs.txt",
     )
+    parser.add_argument(
+        "--lambda_c", type=float, default=1.0,
+        help="weight for composition branch scoring (default: 1.0)",
+    )
+    parser.add_argument(
+        "--lambda_a", type=float, default=0.5,
+        help="weight for attribute branch scoring (default: 0.5)",
+    )
+    parser.add_argument(
+        "--lambda_o", type=float, default=0.5,
+        help="weight for object branch scoring (default: 0.5)",
+    )
     return parser.parse_args()
 
 
@@ -96,22 +109,29 @@ def encode_all_pairs(
     pairs: list[tuple[str, str]],
     batch_size: int,
     device: torch.device,
-) -> torch.Tensor:
-    """Return (num_pairs, 1536) L2-normalised embeddings for every pair text.
-    
-    Encodes attribute and object separately and sums their embeddings to
-    encourage compositional generalization to unseen pairs.
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return three embedding banks: attr, obj, and composition (attr+obj summed).
+
+    Each is (num_pairs, 1536) L2-normalised. Used for three-branch scoring
+    at eval time, following PromptCCZSL inference protocol.
     """
     import torch.nn.functional as F
     attrs = [attr for attr, obj in pairs]
     objs  = [obj  for attr, obj in pairs]
-    chunks = []
+    attr_chunks, obj_chunks, comp_chunks = [], [], []
     for i in range(0, len(attrs), batch_size):
-        attr_chunk = y_encoder(attrs[i : i + batch_size])   # (B, 1536)
-        obj_chunk  = y_encoder(objs[i  : i + batch_size])   # (B, 1536)
-        combined   = F.normalize(attr_chunk + obj_chunk, dim=-1)  # (B, 1536)
-        chunks.append(combined.cpu())
-    return torch.cat(chunks, dim=0)                          # (num_pairs, 1536)
+        ae = y_encoder(attrs[i : i + batch_size])            # (B, 1536)
+        oe = y_encoder(objs[i  : i + batch_size])            # (B, 1536)
+        ce = F.normalize(ae + oe, dim=-1)                    # (B, 1536)
+        attr_chunks.append(ae.cpu())
+        obj_chunks.append(oe.cpu())
+        comp_chunks.append(ce.cpu())
+    return (
+        torch.cat(attr_chunks, dim=0),   # (num_pairs, 1536)
+        torch.cat(obj_chunks,  dim=0),
+        torch.cat(comp_chunks, dim=0),
+    )
+
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
@@ -153,11 +173,19 @@ def main() -> None:
         Path(args.checkpoint), device
     )
 
-    # ── Pre-compute pair embeddings ───────────────────────────────────────────
+    # ── Pre-compute three embedding banks ────────────────────────────────────
     logger.info("Encoding %d pair texts via y_encoder …", len(test_dataset.pairs))
-    pair_embeds = encode_all_pairs(
+    attr_embeds_bank, obj_embeds_bank, comp_embeds_bank = encode_all_pairs(
         y_encoder, test_dataset.pairs, args.batch_size, device
-    ).to(device)                             # (num_pairs, 1536)
+    )
+    attr_embeds_bank = attr_embeds_bank.to(device)   # (num_pairs, 1536)
+    obj_embeds_bank  = obj_embeds_bank.to(device)
+    comp_embeds_bank = comp_embeds_bank.to(device)
+
+    logger.info(
+        "Scoring weights: λc=%.2f  λa=%.2f  λo=%.2f",
+        args.lambda_c, args.lambda_a, args.lambda_o,
+    )
 
     # Boolean mask: True for pairs present in the training split.
     seen_mask = torch.tensor(
@@ -180,15 +208,17 @@ def main() -> None:
             patch_tokens = visual_encoder(clips)               # (B, F, P, 1024)
 
             # Step 2 — Visual prediction in the shared embedding space.
-            # An empty text query lets visual tokens dominate; the predictor
-            # then produces an embedding that should be nearest to the correct
-            # pair text embedding.
             empty_texts = ["a photo of"] * clips.size(0)
-            pred_embeds  = predictor(patch_tokens, empty_texts)  # (B, 1536), L2-normed
+            pred_embeds = predictor(patch_tokens, empty_texts)  # (B, 1536), L2-normed
 
-            # Step 3 — Nearest-neighbour retrieval over all pair embeddings.
-            # Both sides are L2-normalised so dot product == cosine similarity.
-            sims  = pred_embeds @ pair_embeds.T               # (B, num_pairs)
+            # Step 3 — Three-branch scoring following PromptCCZSL protocol.
+            # Score against attr, obj, and composition embeddings separately,
+            # then combine. λ weights are argparse-tunable.
+            sims = (
+                args.lambda_c * (pred_embeds @ comp_embeds_bank.T)
+              + args.lambda_a * (pred_embeds @ attr_embeds_bank.T)
+              + args.lambda_o * (pred_embeds @ obj_embeds_bank.T)
+            )                                                  # (B, num_pairs)
             preds = sims.argmax(dim=1)                        # (B,)
 
             for pred_idx, gt_idx in zip(preds.tolist(), pair_idxs.tolist()):
@@ -226,6 +256,7 @@ def main() -> None:
     print(f"  Unseen accuracy :  {unseen_acc * 100:6.2f}%"
           f"  ({correct_unseen}/{total_unseen})")
     print(f"  Harmonic mean   :  {hm * 100:6.2f}%")
+    print(f"  λc={args.lambda_c}  λa={args.lambda_a}  λo={args.lambda_o}")
     print("=" * 52)
     print()
 

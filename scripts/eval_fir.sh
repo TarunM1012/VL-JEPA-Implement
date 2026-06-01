@@ -19,7 +19,3 @@ export HF_DATASETS_OFFLINE=1
 
 export CHECKPOINT_DIR=/scratch/tarunm10/vljepa_checkpoints
 python evaluate.py --batch_size 32 "$@"
-
-EOF
-
-sbatch scripts/eval_narval.sh

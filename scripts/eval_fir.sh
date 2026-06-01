@@ -3,7 +3,7 @@
 #SBATCH --gres=gpu:h100:1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=20G
-#SBATCH --time=00:20:00
+#SBATCH --time=00:50:00
 #SBATCH --job-name=vljepa-eval
 #SBATCH --output=logs/eval_%j.out
 #SBATCH --error=logs/eval_%j.err

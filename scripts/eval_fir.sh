@@ -9,7 +9,9 @@
 #SBATCH --error=logs/eval_%j.err
 
 module load python/3.10
-module load cuda/12.2
+module load cuda/12.6
+nvidia-smi
+python -c "import torch; print('CUDA available:', torch.cuda.is_available())"
 
 source ~/vljepa_env/bin/activate
 cd ~/VL-JEPA-Implement

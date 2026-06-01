@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --account=def-fqureshi       # Compute Canada allocation account
 #SBATCH --job-name=vljepa-train      # Name shown in squeue
-#SBATCH --gres=gpu:h100:1            # Request one A100 40GB GPU
+#SBATCH --gres=gpu:h100:1            # Request one H100 40GB GPU
 #SBATCH --cpus-per-task=4            # CPU cores for data loading workers
 #SBATCH --mem=64G                    # Host RAM (mirrors GPU VRAM to avoid bottleneck)
 #SBATCH --time=24:00:00              # Wall-clock limit (HH:MM:SS)

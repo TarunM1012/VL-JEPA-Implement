@@ -91,9 +91,6 @@ class Predictor(nn.Module):
 
         # --- LLaMA transformer layers (trainable) -------------------------
         self.llama_layers = layers  # nn.ModuleList → registered for state_dict / .to()
-        # Freeze layers 8–11 (indices 0–3); only train 12–15 (indices 4–7)
-        for p in self.llama_layers[:4].parameters():
-            p.requires_grad = False
         self.norm = norm             # LLaMA's final RMSNorm; small but trained jointly
 
         # rotary_emb is LLaMA's shared position-encoding module (no learnable
@@ -201,7 +198,7 @@ class Predictor(nn.Module):
         not apply a separate multiplier to the predictor's head.
         """
         backbone_params = (
-            list(self.llama_layers[4:].parameters())  # only layers 12-15
+            list(self.llama_layers.parameters())  # all 8 layers (8-15)
             + list(self.norm.parameters())
         )
         head_params = (

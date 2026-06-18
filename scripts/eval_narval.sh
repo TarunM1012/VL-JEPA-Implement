@@ -17,7 +17,7 @@ cd /lustre06/project/6001346/tarunm10/VL-JEPA-Implement
 export TRANSFORMERS_OFFLINE=1
 export HF_DATASETS_OFFLINE=1
 
-python evaluate.py --batch_size 32
+python evaluate.py --batch_size 32 "$@"
 EOF
 
 sbatch scripts/eval_narval.sh

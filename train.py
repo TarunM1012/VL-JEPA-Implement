@@ -13,6 +13,7 @@ import argparse
 import logging
 import sys
 from pathlib import Path
+import os
 
 import torch
 import torch.nn.functional as F
@@ -61,7 +62,7 @@ def parse_args() -> argparse.Namespace:
 
 # ── Checkpoint helpers ────────────────────────────────────────────────────────
 
-CKPT_DIR = Path("checkpoints")
+CKPT_DIR = Path(os.environ.get("CHECKPOINT_DIR", "checkpoints"))
 
 
 def save_checkpoint(
@@ -215,52 +216,56 @@ def main() -> None:
             pred_embeds = predictor(patch_tokens, queries)   # (B, 1536)
 
             # Step 4 — Bidirectional InfoNCE loss
-            #loss = loss_fn(pred_embeds, target_embeds)
+            infonce_loss = loss_fn(pred_embeds, target_embeds)
 
-            #new loss
-            # ── Auxiliary compositional loss ──────────────────────────────────────
+            # ── Auxiliary compositional loss (vectorized, gradient-connected) ──
             # For pairs in the batch that share the same attribute, pull their
             # attr embeddings together. Same for shared objects.
             # This forces the model to learn transferable primitive representations.
+            # NOTE: no .item() calls — gradients flow through aux_loss into
+            # attr_embeds and obj_embeds, which backprop into y_encoder.
             aux_loss = torch.tensor(0.0, device=device)
-            num_aux = 0
 
             for i in range(len(attrs)):
                 for j in range(i + 1, len(attrs)):
                     if attrs[i] == attrs[j]:
                         # same attribute — embeddings should be similar
-                        aux_loss += 1 - F.cosine_similarity(
+                        aux_loss = aux_loss + (1 - F.cosine_similarity(
                             attr_embeds[i].unsqueeze(0),
-                            attr_embeds[j].unsqueeze(0)
-                        ).item()
-                        num_aux += 1
+                            attr_embeds[j].unsqueeze(0),
+                        ))
                     if objs[i] == objs[j]:
                         # same object — embeddings should be similar
-                        aux_loss += 1 - F.cosine_similarity(
+                        aux_loss = aux_loss + (1 - F.cosine_similarity(
                             obj_embeds[i].unsqueeze(0),
-                            obj_embeds[j].unsqueeze(0)
-                        ).item()
-                        num_aux += 1
+                            obj_embeds[j].unsqueeze(0),
+                        ))
 
-            if num_aux > 0:
-                aux_loss = aux_loss / num_aux
+            # Normalise by batch size so scale is stable regardless of
+            # how many same-primitive collisions happen in this batch.
+            aux_loss = aux_loss / len(attrs)
 
-            # Combine losses — 0.1 weight keeps aux from dominating
-            loss = loss_fn(pred_embeds, target_embeds) + 0.1 * aux_loss
-
+            # Combine losses — 0.1 weight keeps aux from dominating InfoNCE
+            loss = infonce_loss + 0.1 * aux_loss
 
             # Step 5 — Backprop
             optimizer.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                list(predictor.parameters()) + list(y_encoder.parameters()),
+                max_norm=1.0,
+            )
             optimizer.step()
 
             global_step += 1
 
             if global_step % 10 == 0:
                 logger.info(
-                    "epoch=%d  step=%d  loss=%.4f  aux=%.4f  tau=%.4f",
+                    "epoch=%d  step=%d  loss=%.4f  infonce=%.4f  aux=%.4f  tau=%.4f",
                     epoch + 1, global_step,
-                    loss.item(), aux_loss.item(), loss_fn.tau.item(),
+                    loss.item(), infonce_loss.item(),
+                    aux_loss.item() if isinstance(aux_loss, torch.Tensor) else aux_loss,
+                    loss_fn.tau.item(),
                 )
 
             if global_step % 1000 == 0:

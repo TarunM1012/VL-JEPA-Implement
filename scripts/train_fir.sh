@@ -1,9 +1,9 @@
 #!/bin/bash
 #SBATCH --account=def-fqureshi       # Compute Canada allocation account
 #SBATCH --job-name=vljepa-train      # Name shown in squeue
-#SBATCH --gres=gpu:a100:1            # Request one A100 40GB GPU
+#SBATCH --gres=gpu:h100:1            # Request one H100 40GB GPU
 #SBATCH --cpus-per-task=4            # CPU cores for data loading workers
-#SBATCH --mem=40G                    # Host RAM (mirrors GPU VRAM to avoid bottleneck)
+#SBATCH --mem=64G                    # Host RAM (mirrors GPU VRAM to avoid bottleneck)
 #SBATCH --time=24:00:00              # Wall-clock limit (HH:MM:SS)
 #SBATCH --output=logs/train_%j.out   # stdout; %j expands to SLURM job ID
 #SBATCH --error=logs/train_%j.err    # stderr; kept separate for easier debugging
@@ -29,6 +29,8 @@ cd /lustre06/project/6001346/tarunm10/VL-JEPA-Implement
 # Ensure output directories exist before the job writes to them
 mkdir -p logs
 mkdir -p checkpoints
+export CHECKPOINT_DIR=/scratch/tarunm10/vljepa_checkpoints
+mkdir -p $CHECKPOINT_DIR
 
 # ---------------------------------------------------------------------------
 # Training

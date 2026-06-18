@@ -3,11 +3,15 @@ CZSL evaluation for VL-JEPA on MIT-States.
 
 Protocol
 --------
-1. Pre-compute y_encoder embeddings for every (attr, obj) pair in the vocabulary.
-2. For each test image, run visual_encoder → predictor (empty text query) to
-   produce a visual prediction in the shared embedding space.
-3. Three-branch scoring following PromptCCZSL protocol: score against attr,
-   obj, and composition embeddings separately, then combine.
+1. Pre-compute y_encoder embeddings for every (attr, obj) pair in the
+   vocabulary, in three banks: attribute-only Y("attr"), object-only Y("obj"),
+   and full-composition Y("attr obj").
+2. For each test image, run visual_encoder once, then the three primitive
+   heads to produce attribute, object, and composition predictions in the
+   shared embedding space.  The composition prediction fuses the attr/obj
+   head outputs through the composition head.
+3. Three-branch scoring: each prediction is scored against its matching bank,
+   then combined with λ weights into a per-pair score.
 4. Report seen accuracy, unseen accuracy, and harmonic mean (HM).
 
 Seen / unseen split: pairs listed in train_pairs.txt are "seen"; all other
@@ -26,8 +30,7 @@ from torch.utils.data import DataLoader
 sys.path.insert(0, str(Path(__file__).parent))
 
 from data.mit_states import MITStates as MITStatesDataset, _load_pairs
-from models.loss import InfoNCELoss
-from models.predictor import Predictor
+from models.primitive_heads import PrimitiveHeads
 from models.visual_encoder import VisualEncoder
 from models.y_encoder import YEncoder
 
@@ -79,7 +82,7 @@ def parse_args() -> argparse.Namespace:
 
 def load_models(
     ckpt_path: Path, device: torch.device
-) -> tuple[VisualEncoder, YEncoder, Predictor]:
+) -> tuple[VisualEncoder, YEncoder, PrimitiveHeads]:
     logger.info("Loading checkpoint: %s", ckpt_path)
     state = torch.load(ckpt_path, map_location="cpu", weights_only=False)
 
@@ -93,12 +96,15 @@ def load_models(
     y_encoder.load_state_dict(state["y_encoder"])
     y_encoder.eval()
 
-    logger.info("Building Predictor …")
-    predictor = Predictor.load_pretrained(device=device).to(device)
-    predictor.load_state_dict(state["predictor"])
-    predictor.eval()
+    logger.info("Building PrimitiveHeads …")
+    # Rebuild with the exact architecture used at train time when the
+    # checkpoint records it; fall back to defaults for older checkpoints.
+    head_config = state.get("head_config") or {}
+    primitive_heads = PrimitiveHeads.build(device=device, **head_config)
+    primitive_heads.load_state_dict(state["primitive_heads"])
+    primitive_heads.eval()
 
-    return visual_encoder, y_encoder, predictor
+    return visual_encoder, y_encoder, primitive_heads
 
 
 # ── Pair embedding cache ──────────────────────────────────────────────────────
@@ -110,19 +116,25 @@ def encode_all_pairs(
     batch_size: int,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return three embedding banks: attr, obj, and composition (attr+obj summed).
+    """Return three embedding banks: attribute, object, and composition.
 
-    Each is (num_pairs, 1536) L2-normalised. Used for three-branch scoring
-    at eval time, following PromptCCZSL inference protocol.
+    Each is (num_pairs, 1536) L2-normalised, matching the targets each head was
+    trained against:
+        attr bank : Y("attr")        — attribute word alone
+        obj  bank : Y("obj")         — object word alone
+        comp bank : Y("attr obj")    — the full composition phrase
+
+    The composition bank is the Y-encoder embedding of the full phrase (NOT a
+    sum of attr+obj), consistent with how the composition head is trained.
     """
-    import torch.nn.functional as F
-    attrs = [attr for attr, obj in pairs]
-    objs  = [obj  for attr, obj in pairs]
+    attrs  = [attr           for attr, obj in pairs]
+    objs   = [obj            for attr, obj in pairs]
+    phrases = [f"{attr} {obj}" for attr, obj in pairs]
     attr_chunks, obj_chunks, comp_chunks = [], [], []
     for i in range(0, len(attrs), batch_size):
-        ae = y_encoder(attrs[i : i + batch_size])            # (B, 1536)
-        oe = y_encoder(objs[i  : i + batch_size])            # (B, 1536)
-        ce = F.normalize(ae + oe, dim=-1)                    # (B, 1536)
+        ae = y_encoder(attrs[i   : i + batch_size])          # (B, 1536) = Y("attr")
+        oe = y_encoder(objs[i    : i + batch_size])          # (B, 1536) = Y("obj")
+        ce = y_encoder(phrases[i : i + batch_size])          # (B, 1536) = Y("attr obj")
         attr_chunks.append(ae.cpu())
         obj_chunks.append(oe.cpu())
         comp_chunks.append(ce.cpu())
@@ -169,7 +181,7 @@ def main() -> None:
     )
 
     # ── Models ────────────────────────────────────────────────────────────────
-    visual_encoder, y_encoder, predictor = load_models(
+    visual_encoder, y_encoder, primitive_heads = load_models(
         Path(args.checkpoint), device
     )
 
@@ -204,20 +216,20 @@ def main() -> None:
             clips     = clips.to(device, non_blocking=True)   # (B, F, C, H, W)
             pair_idxs = pair_idxs.to(device)                  # (B,)
 
-            # Step 1 — Visual encoding.
+            # Step 1 — Visual encoding (shared by all three heads).
             patch_tokens = visual_encoder(clips)               # (B, F, P, 1024)
 
-            # Step 2 — Visual prediction in the shared embedding space.
-            empty_texts = ["a photo of"] * clips.size(0)
-            pred_embeds = predictor(patch_tokens, empty_texts)  # (B, 1536), L2-normed
+            # Step 2 — Per-primitive predictions in the shared embedding space.
+            attr_pred = primitive_heads.forward_attribute(patch_tokens)  # (B, 1536)
+            obj_pred  = primitive_heads.forward_object(patch_tokens)     # (B, 1536)
+            comp_pred = primitive_heads.compose(attr_pred, obj_pred)     # (B, 1536)
 
-            # Step 3 — Three-branch scoring following PromptCCZSL protocol.
-            # Score against attr, obj, and composition embeddings separately,
-            # then combine. λ weights are argparse-tunable.
+            # Step 3 — Three-branch scoring: each prediction is matched to its
+            # own bank, then combined with λ weights.
             sims = (
-                args.lambda_c * (pred_embeds @ comp_embeds_bank.T)
-              + args.lambda_a * (pred_embeds @ attr_embeds_bank.T)
-              + args.lambda_o * (pred_embeds @ obj_embeds_bank.T)
+                args.lambda_c * (comp_pred @ comp_embeds_bank.T)
+              + args.lambda_a * (attr_pred @ attr_embeds_bank.T)
+              + args.lambda_o * (obj_pred  @ obj_embeds_bank.T)
             )                                                  # (B, num_pairs)
             preds = sims.argmax(dim=1)                        # (B,)
 

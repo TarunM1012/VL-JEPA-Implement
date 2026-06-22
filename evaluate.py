@@ -75,6 +75,11 @@ def parse_args() -> argparse.Namespace:
         "--lambda_o", type=float, default=0.5,
         help="weight for object branch scoring (default: 0.5)",
     )
+    parser.add_argument(
+        "--gamma_sweep", action=argparse.BooleanOptionalAction, default=True,
+        help="sweep calibration bias γ over [-2, 2] and report best HM + AUC "
+             "(disable with --no-gamma_sweep for single-pass eval)",
+    )
     return parser.parse_args()
 
 
@@ -206,8 +211,10 @@ def main() -> None:
     )                                        # (num_pairs,)
 
     # ── Evaluation loop ───────────────────────────────────────────────────────
-    total_seen = correct_seen = 0
-    total_unseen = correct_unseen = 0
+    # Always collect per-image ground-truth indices and base scores so the
+    # γ sweep can reuse them without re-running the visual encoder.
+    all_scores:    list[torch.Tensor] = []   # each (B, num_pairs) on CPU
+    all_pair_idxs: list[torch.Tensor] = []   # each (B,) on CPU
 
     with torch.no_grad():
         for batch_idx, (clips, _texts, _attr_idxs, _obj_idxs, pair_idxs) in enumerate(
@@ -224,25 +231,15 @@ def main() -> None:
             obj_pred  = primitive_heads.forward_object(patch_tokens)     # (B, 1536)
             comp_pred = primitive_heads.compose(attr_pred, obj_pred)     # (B, 1536)
 
-            # Step 3 — Three-branch scoring: each prediction is matched to its
-            # own bank, then combined with λ weights.
+            # Step 3 — Three-branch λ-weighted base scores (no γ yet).
             sims = (
                 args.lambda_c * (comp_pred @ comp_embeds_bank.T)
               + args.lambda_a * (attr_pred @ attr_embeds_bank.T)
               + args.lambda_o * (obj_pred  @ obj_embeds_bank.T)
             )                                                  # (B, num_pairs)
-            preds = sims.argmax(dim=1)                        # (B,)
 
-            for pred_idx, gt_idx in zip(preds.tolist(), pair_idxs.tolist()):
-                gt_pair  = test_dataset.pairs[gt_idx]
-                is_seen  = gt_pair in seen_pairs
-                correct  = pred_idx == gt_idx
-                if is_seen:
-                    total_seen   += 1
-                    correct_seen  += int(correct)
-                else:
-                    total_unseen   += 1
-                    correct_unseen += int(correct)
+            all_scores.append(sims.cpu())
+            all_pair_idxs.append(pair_idxs.cpu())
 
             if (batch_idx + 1) % 20 == 0:
                 logger.info(
@@ -250,26 +247,81 @@ def main() -> None:
                     batch_idx + 1, len(test_loader),
                 )
 
-    # ── Results ───────────────────────────────────────────────────────────────
-    seen_acc   = correct_seen   / total_seen   if total_seen   else 0.0
-    unseen_acc = correct_unseen / total_unseen if total_unseen else 0.0
-    hm = (
-        2 * seen_acc * unseen_acc / (seen_acc + unseen_acc)
-        if (seen_acc + unseen_acc) > 0
-        else 0.0
-    )
+    # (N_test, num_pairs) base score matrix — built once, reused for every γ.
+    base_scores = torch.cat(all_scores,    dim=0)   # (N_test, num_pairs)
+    gt_indices  = torch.cat(all_pair_idxs, dim=0)   # (N_test,)
 
+    # Boolean GT membership: True when the ground-truth pair is seen/unseen.
+    gt_is_seen = torch.tensor(
+        [test_dataset.pairs[i] in seen_pairs for i in gt_indices.tolist()],
+        dtype=torch.bool,
+    )                                                # (N_test,)
+    seen_mask_cpu = seen_mask.cpu()                  # (num_pairs,) — for γ offset
+
+    # ── Helper: accuracy at a given score matrix ──────────────────────────────
+    def _accuracy(scores: torch.Tensor) -> tuple[float, float]:
+        preds   = scores.argmax(dim=1)               # (N_test,)
+        correct = preds == gt_indices                # (N_test,)
+        s_acc = correct[gt_is_seen].float().mean().item()  if gt_is_seen.any()  else 0.0
+        u_acc = correct[~gt_is_seen].float().mean().item() if (~gt_is_seen).any() else 0.0
+        return s_acc, u_acc
+
+    def _hm(s: float, u: float) -> float:
+        return 2 * s * u / (s + u) if (s + u) > 0 else 0.0
+
+    # ── Single-pass results (γ = 0, original behavior) ───────────────────────
+    seen_acc, unseen_acc = _accuracy(base_scores)
+    hm = _hm(seen_acc, unseen_acc)
+
+    if not args.gamma_sweep:
+        print()
+        print("=" * 52)
+        print("  VL-JEPA  |  MIT-States CZSL Results")
+        print("=" * 52)
+        print(f"  Seen accuracy   :  {seen_acc * 100:6.2f}%")
+        print(f"  Unseen accuracy :  {unseen_acc * 100:6.2f}%")
+        print(f"  Harmonic mean   :  {hm * 100:6.2f}%")
+        print(f"  λc={args.lambda_c}  λa={args.lambda_a}  λo={args.lambda_o}")
+        print("=" * 52)
+        print()
+        return
+
+    # ── Calibration γ sweep ───────────────────────────────────────────────────
+    gammas = torch.linspace(-2.0, 2.0, 20).tolist()
+    rows: list[tuple[float, float, float, float]] = []  # (γ, seen, unseen, hm)
+
+    unseen_mask_cpu = ~seen_mask_cpu  # columns to offset
+    for gamma in gammas:
+        scores = base_scores.clone()
+        scores[:, unseen_mask_cpu] += gamma
+        s, u = _accuracy(scores)
+        rows.append((gamma, s, u, _hm(s, u)))
+
+    best = max(rows, key=lambda r: r[3])
+
+    # AUC: trapezoidal area under the seen-vs-unseen curve, sorted by unseen_acc.
+    pts = sorted(rows, key=lambda r: r[2])           # sort by unseen_acc
+    xs  = [r[2] for r in pts]                        # unseen axis
+    ys  = [r[1] for r in pts]                        # seen axis
+    auc = float(torch.trapezoid(torch.tensor(ys), torch.tensor(xs)).abs())
+
+    # ── Print summary table ───────────────────────────────────────────────────
+    W = 52
     print()
-    print("=" * 52)
-    print("  VL-JEPA  |  MIT-States CZSL Results")
-    print("=" * 52)
-    print(f"  Seen accuracy   :  {seen_acc * 100:6.2f}%"
-          f"  ({correct_seen}/{total_seen})")
-    print(f"  Unseen accuracy :  {unseen_acc * 100:6.2f}%"
-          f"  ({correct_unseen}/{total_unseen})")
-    print(f"  Harmonic mean   :  {hm * 100:6.2f}%")
+    print("=" * W)
+    print("  VL-JEPA | MIT-States CZSL Calibration Sweep")
+    print("=" * W)
+    print(f"  {'γ':>6}   {'Seen':>8}   {'Unseen':>8}   {'HM':>8}")
+    print("-" * W)
+    for gamma, s, u, h in rows:
+        marker = "  ← best" if (gamma, s, u, h) == best else ""
+        print(f"  {gamma:>6.2f}   {s*100:>7.2f}%   {u*100:>7.2f}%   {h*100:>7.2f}%{marker}")
+    print("=" * W)
+    print(f"  AUC: {auc:.4f}")
+    print(f"  Best HM: {best[3]*100:.2f}%  at γ={best[0]:.2f}")
+    print(f"  (Seen={best[1]*100:.2f}%, Unseen={best[2]*100:.2f}%)")
     print(f"  λc={args.lambda_c}  λa={args.lambda_a}  λo={args.lambda_o}")
-    print("=" * 52)
+    print("=" * W)
     print()
 
 

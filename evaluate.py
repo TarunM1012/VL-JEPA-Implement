@@ -76,6 +76,10 @@ def parse_args() -> argparse.Namespace:
         help="weight for object branch scoring (default: 0.5)",
     )
     parser.add_argument(
+        "--phase", choices=["train", "val", "test"], default="test",
+        help="which dataset split to evaluate (default: test)",
+    )
+    parser.add_argument(
         "--gamma_sweep", action=argparse.BooleanOptionalAction, default=True,
         help="sweep calibration bias γ over [-2, 2] and report best HM + AUC "
              "(disable with --no-gamma_sweep for single-pass eval)",
@@ -159,7 +163,7 @@ def main() -> None:
 
     # ── Datasets ──────────────────────────────────────────────────────────────
     test_dataset = MITStatesDataset(
-        phase="test",
+        phase=args.phase,
         num_frames=args.num_frames,
         images_root=args.data_root,
         splits_root=args.split_root,
@@ -172,7 +176,8 @@ def main() -> None:
     num_seen_vocab   = sum(1 for p in test_dataset.pairs if p in seen_pairs)
     num_unseen_vocab = sum(1 for p in test_dataset.pairs if p not in seen_pairs)
     logger.info(
-        "Test samples: %d | Vocabulary: %d pairs (%d seen, %d unseen)",
+        "%s samples: %d | Vocabulary: %d pairs (%d seen, %d unseen)",
+        args.phase.capitalize(),
         len(test_dataset), len(test_dataset.pairs),
         num_seen_vocab, num_unseen_vocab,
     )

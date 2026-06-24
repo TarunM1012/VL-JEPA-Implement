@@ -271,7 +271,7 @@ def main() -> None:
     # ── Helper: accuracy at a given score matrix ──────────────────────────────
     def _accuracy(scores: torch.Tensor) -> tuple[float, float]:
         if not args.gamma_sweep and args.gamma != 0.0:
-            scores = scores + args.gamma * (~seen_mask).float().unsqueeze(0)
+            scores = scores + args.gamma * (~seen_mask_cpu).float().unsqueeze(0)
         preds   = scores.argmax(dim=1)               # (N_test,)
         correct = preds == gt_indices                # (N_test,)
         s_acc = correct[gt_is_seen].float().mean().item()  if gt_is_seen.any()  else 0.0

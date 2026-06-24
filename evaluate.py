@@ -84,6 +84,11 @@ def parse_args() -> argparse.Namespace:
         help="sweep calibration bias γ over [-2, 2] and report best HM + AUC "
              "(disable with --no-gamma_sweep for single-pass eval)",
     )
+    parser.add_argument(
+        "--gamma", type=float, default=0.0,
+        help="fixed calibration bias added to unseen pair scores at inference "
+            "(ignored when --gamma_sweep is active)",
+    )
     return parser.parse_args()
 
 
@@ -265,6 +270,8 @@ def main() -> None:
 
     # ── Helper: accuracy at a given score matrix ──────────────────────────────
     def _accuracy(scores: torch.Tensor) -> tuple[float, float]:
+        if not args.gamma_sweep and args.gamma != 0.0:
+            scores = scores + args.gamma * (~seen_mask).float().unsqueeze(0)
         preds   = scores.argmax(dim=1)               # (N_test,)
         correct = preds == gt_indices                # (N_test,)
         s_acc = correct[gt_is_seen].float().mean().item()  if gt_is_seen.any()  else 0.0

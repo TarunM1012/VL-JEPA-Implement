@@ -35,12 +35,14 @@ The model has four components that are built and tested independently:
 |---|---|---|---|
 | X-Encoder | `models/visual_encoder.py` | ✅ Done | Encodes context frames; frozen V-JEPA 2 with ViT-L/16 timm fallback |
 | Y-Encoder | `models/y_encoder.py` | ✅ Done | Frozen EmbeddingGemma-300M backbone + trainable Linear(hidden→1536) head; L2-normalised output |
-| Predictor | `models/predictor.py` | ✅ Done | LLaMA 3.2-1B layers 8–15 (≈490M); bidirectional attention; fuses visual patches + text query; L2-normalised 1536-dim output |
-| Language Encoder | `models/language_encoder.py` | ⬜ Todo | LLaMA 3 transformer layers for text conditioning |
+| Primitive Heads | `models/primitive_heads.py` | ✅ Done | Three from-scratch bidirectional encoder heads: AttributeHead, ObjectHead (each ~14M params), CompositionHead MLP; routed by `data/primitive_sampler.py` |
+| Language Encoder | `models/language_encoder.py` | ⬜ Todo | (reserved; not used in current approach) |
 
-**Loss** (`models/loss.py`): prediction loss + anti-collapse regularization. ⬜ Todo
+**Loss** (`models/loss.py`): bidirectional InfoNCE, computed independently per head per batch type. ✅ Done
 
-**Training** (`scripts/train.py`): main training loop. ⬜ Todo
+**Training** (`train.py`): three-head routing loop via `RoutingDataLoader`. ✅ Done
+
+**Data routing** (`data/primitive_sampler.py`): `PrimitiveBatchSampler` + `RoutingDataLoader`; guarantees distinct primitive keys per batch, interleaves attr/obj/comp streams round-robin. ✅ Done
 
 **Config** (`configs/base.yaml`): YAML-based model and training hyperparameters, loaded via PyYAML.
 
@@ -50,8 +52,10 @@ The model has four components that are built and tested independently:
 
 - **VisualEncoder** (`visual_encoder.py`): V-JEPA 2 strips CLS token, returns `(B, F, num_patches, 1024)`. Timm fallback encodes frames independently.
 - **YEncoder** (`y_encoder.py`): EmbeddingGemma-300M frozen; attention-mask-weighted mean pool; `Linear(hidden→1536, bias=False)`; projection head uses 5% of base LR.
-- **Predictor** (`predictor.py`): Extracts `llama.model.layers[8:16]` + `embed_tokens` (frozen) + `norm` + `rotary_emb`. Visual tokens prepended to text tokens. Bidirectional mask: additive 4-D `(B,1,1,S)` with −inf on padding columns, no causal triangle. `attn_implementation="eager"` avoids SDPA `cache_position` requirement. `_pass_position_embeddings` flag probed at init for transformers ≥ 4.45 compatibility.
+- **PrimitiveHeads** (`primitive_heads.py`): Three heads — two `TransformerHead` (attr/obj, ~14M params each, hidden=512, 4 layers, 8 heads, bidirectional, mean-pool, pre-LN) + one `CompositionHead` (MLP, concat fusion, ~9.4M params). Composition head runs attr/obj heads under `no_grad` so comp-batch gradients never touch attr/obj weights.
+- **RoutingDataLoader** (`data/primitive_sampler.py`): `PrimitiveBatchSampler` guarantees distinct primitive keys per batch (no false negatives in InfoNCE). Texts returned are already mode-appropriate (attr-word / obj-word / full phrase).
 
 ## Development approach
 
-Build one component at a time and test it before moving on. Current branch: `predictor`.
+Build one component at a time and test it before moving on. Current branch: `v2r1-primitive-heads`.
+Update CONTEXT.md after every significant change or fix.

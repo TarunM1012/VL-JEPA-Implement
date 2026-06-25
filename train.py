@@ -1,12 +1,21 @@
 """
 Main training loop for VL-JEPA on MIT-States CZSL.
 
+Three-head routing
+------------------
+Each optimiser step trains exactly ONE primitive head against its own batch
+type, routed by `RoutingDataLoader` (see data/primitive_sampler.py):
+
+    attr-batch ─► attr_head(visual)        vs  Y("red")        ─┐
+    obj-batch  ─► obj_head(visual)         vs  Y("chair")       ├─ InfoNCE
+    comp-batch ─► comp_head(attr_e, obj_e) vs  Y("red chair")  ─┘  (per head)
+
 Pipeline per batch
 ------------------
-clips  (B, F, C, H, W)  ──►  VisualEncoder  ──►  patch tokens  (B, F, P, 1024)
-texts  List[str]         ──►  YEncoder       ──►  target embeds  (B, 1536)
-patch tokens + texts     ──►  Predictor      ──►  pred embeds    (B, 1536)
-pred + target            ──►  InfoNCELoss    ──►  scalar loss
+clips (B, F, C, H, W)  ──►  VisualEncoder  ──►  patch tokens (B, F, P, 1024)
+texts List[str]        ──►  YEncoder       ──►  target embeds (B, 1536)
+patch tokens           ──►  one head       ──►  pred embeds   (B, 1536)
+pred + target          ──►  InfoNCELoss    ──►  scalar loss (backprop one head)
 """
 
 import argparse
@@ -16,14 +25,13 @@ from pathlib import Path
 import os
 
 import torch
-import torch.nn.functional as F
-from torch.utils.data import DataLoader
 
 sys.path.insert(0, str(Path(__file__).parent))
 
 from data.mit_states import MITStates as MITStatesDataset
+from data.primitive_sampler import RoutingDataLoader
 from models.loss import InfoNCELoss
-from models.predictor import Predictor
+from models.primitive_heads import PrimitiveHeads
 from models.visual_encoder import VisualEncoder
 from models.y_encoder import YEncoder
 
@@ -47,6 +55,17 @@ def parse_args() -> argparse.Namespace:
                         help="base learning rate for AdamW")
     parser.add_argument("--num_frames", type=int,   default=2,
                         help="frames per clip (MIT-States repeats the image)")
+    parser.add_argument("--seed",       type=int,   default=0,
+                        help="base RNG seed for the primitive batch sampler")
+    # ── Primitive-head architecture (attr/obj transformer heads) ──
+    parser.add_argument("--head_hidden", type=int, default=512,
+                        help="transformer hidden dim per attr/obj head (384–512)")
+    parser.add_argument("--head_layers", type=int, default=4,
+                        help="transformer encoder layers per attr/obj head (4–6)")
+    parser.add_argument("--head_heads",  type=int, default=8,
+                        help="attention heads per layer (6–8; must divide head_hidden)")
+    parser.add_argument("--head_pool",   choices=["mean", "token"], default="mean",
+                        help="patch pooling: mean-pool or learnable aggregation token")
     parser.add_argument(
         "--data_root",
         default="/scratch/tarunm10/datasets/release_dataset/images",
@@ -70,7 +89,7 @@ def save_checkpoint(
     epoch: int,
     visual_encoder: VisualEncoder,
     y_encoder: YEncoder,
-    predictor: Predictor,
+    primitive_heads: PrimitiveHeads,
     loss_fn: InfoNCELoss,
     optimizer: torch.optim.Optimizer,
 ) -> None:
@@ -78,13 +97,14 @@ def save_checkpoint(
     CKPT_DIR.mkdir(exist_ok=True)
 
     state = {
-        "step":           step,
-        "epoch":          epoch,
-        "visual_encoder": visual_encoder.state_dict(),
-        "y_encoder":      y_encoder.state_dict(),
-        "predictor":      predictor.state_dict(),
-        "loss_fn":        loss_fn.state_dict(),
-        "optimizer":      optimizer.state_dict(),
+        "step":            step,
+        "epoch":           epoch,
+        "visual_encoder":  visual_encoder.state_dict(),
+        "y_encoder":       y_encoder.state_dict(),
+        "primitive_heads": primitive_heads.state_dict(),
+        "head_config":     primitive_heads.config,
+        "loss_fn":         loss_fn.state_dict(),
+        "optimizer":       optimizer.state_dict(),
     }
 
     ckpt_path = CKPT_DIR / f"step_{step:07d}.pt"
@@ -99,7 +119,7 @@ def save_checkpoint(
 def load_checkpoint(
     visual_encoder: VisualEncoder,
     y_encoder: YEncoder,
-    predictor: Predictor,
+    primitive_heads: PrimitiveHeads,
     loss_fn: InfoNCELoss,
     optimizer: torch.optim.Optimizer,
 ) -> tuple[int, int]:
@@ -113,7 +133,7 @@ def load_checkpoint(
 
     visual_encoder.load_state_dict(state["visual_encoder"])
     y_encoder.load_state_dict(state["y_encoder"])
-    predictor.load_state_dict(state["predictor"])
+    primitive_heads.load_state_dict(state["primitive_heads"])
     loss_fn.load_state_dict(state["loss_fn"])
     optimizer.load_state_dict(state["optimizer"])
 
@@ -147,21 +167,22 @@ def main() -> None:
         train_dataset.num_attrs, train_dataset.num_objs, train_dataset.num_pairs,
     )
 
-    train_loader = DataLoader(
+    # Each optimiser step trains one head against a batch of one primitive
+    # type; RoutingDataLoader interleaves the three streams round-robin and
+    # guarantees distinct primitive keys (hence distinct targets) per batch.
+    train_loader = RoutingDataLoader(
         train_dataset,
         batch_size=args.batch_size,
-        shuffle=True,
         num_workers=4,
         pin_memory=True,
-        drop_last=True,
+        seed=args.seed,
     )
-    val_loader = DataLoader(
+    val_loader = RoutingDataLoader(
         val_dataset,
         batch_size=args.batch_size,
-        shuffle=False,
         num_workers=4,
         pin_memory=True,
-        drop_last=False,
+        seed=args.seed,
     )
 
     # ── Models ────────────────────────────────────────────────────────────────
@@ -172,14 +193,20 @@ def main() -> None:
     logger.info("Loading YEncoder …")
     y_encoder = YEncoder.load_pretrained(device=device).to(device)
 
-    logger.info("Loading Predictor …")
-    predictor = Predictor.load_pretrained(device=device).to(device)
+    logger.info("Building PrimitiveHeads …")
+    primitive_heads = PrimitiveHeads.build(
+        hidden_dim=args.head_hidden,
+        num_layers=args.head_layers,
+        num_heads=args.head_heads,
+        pool=args.head_pool,
+        device=device,
+    )
 
     loss_fn = InfoNCELoss().to(device)
 
     # ── Optimizer ─────────────────────────────────────────────────────────────
     optimizer = torch.optim.AdamW(
-        predictor.param_groups(base_lr=args.lr)
+        primitive_heads.param_groups(base_lr=args.lr)
         + y_encoder.param_groups(base_lr=args.lr)
         + [{"params": loss_fn.parameters(), "lr": args.lr}],
         weight_decay=0.05,
@@ -187,38 +214,45 @@ def main() -> None:
 
     # ── Resume ────────────────────────────────────────────────────────────────
     global_step, start_epoch = load_checkpoint(
-        visual_encoder, y_encoder, predictor, loss_fn, optimizer
+        visual_encoder, y_encoder, primitive_heads, loss_fn, optimizer
     )
+
+    # ── Forward routing helper ──────────────────────────────────────────────
+    # Returns (pred_embeds, target_embeds) for the head selected by batch_type.
+    # `texts` already carries the mode-appropriate strings (attribute-only,
+    # object-only, or the full phrase), so the Y-encoder targets are correct
+    # for each head without any further splitting here.
+    def forward_batch(batch_type, patch_tokens, texts):
+        target_embeds = y_encoder(texts)                       # (B, 1536)
+        if batch_type == "attr":
+            pred = primitive_heads.forward_attribute(patch_tokens)
+        elif batch_type == "obj":
+            pred = primitive_heads.forward_object(patch_tokens)
+        else:  # "comp" — attr/obj heads run detached inside forward_composition
+            pred = primitive_heads.forward_composition(patch_tokens)
+        return pred, target_embeds
 
     # ── Training loop ─────────────────────────────────────────────────────────
     for epoch in range(start_epoch, args.epochs):
         logger.info("── Epoch %d / %d ──", epoch + 1, args.epochs)
-        predictor.train()
+        primitive_heads.train()
         y_encoder.train()
+        train_loader.set_epoch(epoch)
 
-        for clips, texts, _attr_idxs, _obj_idxs, _pair_idxs in train_loader:
+        for clips, texts, batch_type in train_loader:
             clips = clips.to(device, non_blocking=True)
-            texts = list(texts)
 
             # Step 1 — Visual encoding (frozen, no grad)
             with torch.no_grad():
                 patch_tokens = visual_encoder(clips)   # (B, F, num_patches, 1024)
 
-            # Step 2 — Encode attr and obj separately, sum for compositionality
-            attrs = [t.split()[0] for t in texts]
-            objs  = [" ".join(t.split()[1:]) for t in texts]
-            attr_embeds   = y_encoder(attrs)                              # (B, 1536)
-            obj_embeds    = y_encoder(objs)                               # (B, 1536)
-            target_embeds = F.normalize(attr_embeds + obj_embeds, dim=-1) # (B, 1536)
+            # Step 2 — Route to the head for this batch type + encode targets
+            pred_embeds, target_embeds = forward_batch(batch_type, patch_tokens, texts)
 
-            # Step 3 — Predict target embeddings from visual tokens
-            queries     = ["a photo of"] * len(texts)
-            pred_embeds = predictor(patch_tokens, queries)   # (B, 1536)
-
-            # Step 4 — Bidirectional InfoNCE loss
+            # Step 3 — Bidirectional InfoNCE loss, computed per head
             loss = loss_fn(pred_embeds, target_embeds)
 
-            # Step 5 — Backprop
+            # Step 4 — Backprop (updates only the routed head + Y-encoder head)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -227,8 +261,8 @@ def main() -> None:
 
             if global_step % 10 == 0:
                 logger.info(
-                    "epoch=%d  step=%d  loss=%.4f  tau=%.4f",
-                    epoch + 1, global_step,
+                    "epoch=%d  step=%d  type=%-4s  loss=%.4f  tau=%.4f",
+                    epoch + 1, global_step, batch_type,
                     loss.item(), loss_fn.tau.item(),
                 )
 
@@ -238,7 +272,7 @@ def main() -> None:
                     epoch=epoch,
                     visual_encoder=visual_encoder,
                     y_encoder=y_encoder,
-                    predictor=predictor,
+                    primitive_heads=primitive_heads,
                     loss_fn=loss_fn,
                     optimizer=optimizer,
                 )
@@ -248,33 +282,35 @@ def main() -> None:
             epoch=epoch + 1,
             visual_encoder=visual_encoder,
             y_encoder=y_encoder,
-            predictor=predictor,
+            primitive_heads=primitive_heads,
             loss_fn=loss_fn,
             optimizer=optimizer,
         )
 
         # ── Validation ────────────────────────────────────────────────────────
-        predictor.eval()
+        # Track loss per batch type so each head's progress is visible.
+        primitive_heads.eval()
         y_encoder.eval()
-        val_loss_sum, val_steps = 0.0, 0
+        val_loss_sum = {"attr": 0.0, "obj": 0.0, "comp": 0.0}
+        val_steps    = {"attr": 0,   "obj": 0,   "comp": 0}
+        val_loader.set_epoch(epoch)
 
         with torch.no_grad():
-            for clips, texts, _attr_idxs, _obj_idxs, _pair_idxs in val_loader:
+            for clips, texts, batch_type in val_loader:
                 clips        = clips.to(device, non_blocking=True)
-                texts        = list(texts)
                 patch_tokens = visual_encoder(clips)
-                attrs        = [t.split()[0] for t in texts]
-                objs         = [" ".join(t.split()[1:]) for t in texts]
-                attr_embeds  = y_encoder(attrs)
-                obj_embeds   = y_encoder(objs)
-                target_embeds = F.normalize(attr_embeds + obj_embeds, dim=-1)
-                queries      = ["a photo of"] * len(texts)
-                pred_embeds  = predictor(patch_tokens, queries)
-                val_loss_sum += loss_fn(pred_embeds, target_embeds).item()
-                val_steps    += 1
+                pred_embeds, target_embeds = forward_batch(batch_type, patch_tokens, texts)
+                val_loss_sum[batch_type] += loss_fn(pred_embeds, target_embeds).item()
+                val_steps[batch_type]    += 1
 
-        val_loss = val_loss_sum / max(val_steps, 1)
-        logger.info("── epoch %d complete  val_loss=%.4f ──", epoch + 1, val_loss)
+        per_type = {
+            t: val_loss_sum[t] / max(val_steps[t], 1) for t in val_loss_sum
+        }
+        val_loss = sum(per_type.values()) / len(per_type)
+        logger.info(
+            "── epoch %d complete  val_loss=%.4f  (attr=%.4f obj=%.4f comp=%.4f) ──",
+            epoch + 1, val_loss, per_type["attr"], per_type["obj"], per_type["comp"],
+        )
 
     logger.info("Training complete — %d steps  %d epochs", global_step, args.epochs)
 

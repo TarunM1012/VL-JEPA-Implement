@@ -226,6 +226,7 @@ class CompositionHead(nn.Module):
         num_layers: int = 3,
         fusion: Literal["concat", "sum"] = "concat",
         dropout: float = 0.0,
+        visual_dim: int = _VISUAL_DIM,
     ) -> None:
         super().__init__()
 
@@ -233,7 +234,7 @@ class CompositionHead(nn.Module):
             raise ValueError(f"CompositionHead needs >=2 layers, got {num_layers}")
         self.fusion = fusion
 
-        in_dim = 2 * embed_dim if fusion == "concat" else embed_dim
+        in_dim = 2 * embed_dim + visual_dim if fusion == "concat" else embed_dim
 
         # Build [Linear → GELU → (dropout)] × (num_layers-1) → Linear(→embed_dim).
         layers: List[nn.Module] = []
@@ -257,10 +258,11 @@ class CompositionHead(nn.Module):
         self,
         attr_embed: torch.Tensor,   # (B, embed_dim), L2-normalised
         obj_embed: torch.Tensor,    # (B, embed_dim), L2-normalised
+        visual_vec: torch.Tensor,   # (B, visual_dim), L2-normalised mean-pooled patch tokens
     ) -> torch.Tensor:
         """Returns (B, embed_dim) L2-normalised composition embeddings."""
         if self.fusion == "concat":
-            x = torch.cat([attr_embed, obj_embed], dim=-1)   # (B, 2*embed_dim)
+            x = torch.cat([attr_embed, obj_embed, visual_vec], dim=-1)  # (B, 2*embed_dim+visual_dim)
         else:  # "sum"
             x = attr_embed + obj_embed                       # (B, embed_dim)
         out = self.mlp(x)                                    # (B, embed_dim)
@@ -311,6 +313,7 @@ class PrimitiveHeads(nn.Module):
         comp_fusion: Literal["concat", "sum"] = "concat",
         comp_layers: int = 3,
         comp_hidden: int = _SHARED_DIM,
+        comp_visual_dim: int = _VISUAL_DIM,
         device: Optional[torch.device] = None,
     ) -> "PrimitiveHeads":
         """Construct all three heads with shared transformer hyperparameters."""
@@ -324,6 +327,7 @@ class PrimitiveHeads(nn.Module):
         )
         comp_head = CompositionHead(
             hidden_dim=comp_hidden, num_layers=comp_layers, fusion=comp_fusion,
+            visual_dim=comp_visual_dim,
         )
         instance = cls(attr_head, obj_head, comp_head)
 
@@ -334,6 +338,7 @@ class PrimitiveHeads(nn.Module):
             hidden_dim=hidden_dim, num_layers=num_layers, num_heads=num_heads,
             ffn_mult=ffn_mult, pool=pool, head_dropout=head_dropout,
             comp_fusion=comp_fusion, comp_layers=comp_layers, comp_hidden=comp_hidden,
+            comp_visual_dim=comp_visual_dim,
         )
 
         total = sum(p.numel() for p in instance.parameters() if p.requires_grad)
@@ -369,9 +374,10 @@ class PrimitiveHeads(nn.Module):
         self,
         attr_embed: torch.Tensor,
         obj_embed: torch.Tensor,
+        visual_vec: torch.Tensor,
     ) -> torch.Tensor:
-        """Fuse precomputed attr/obj embeddings (used at eval time)."""
-        return self.comp_head(attr_embed, obj_embed)
+        """Fuse precomputed attr/obj embeddings and visual_vec (used at eval time)."""
+        return self.comp_head(attr_embed, obj_embed, visual_vec)
 
     def forward_composition(self, visual_embeds: torch.Tensor) -> torch.Tensor:
         """
@@ -381,11 +387,15 @@ class PrimitiveHeads(nn.Module):
         outputs are detached: composition-batch gradients update ONLY the
         composition head, never the attr/obj heads.  This enforces the
         "each head trains on its own batch type" invariant.
+
+        visual_vec is mean-pooled over frames and patches from the frozen encoder
+        output; it carries no grad so it does not break the gradient isolation.
         """
         with torch.no_grad():
             attr_embed = self.attr_head(visual_embeds)
             obj_embed = self.obj_head(visual_embeds)
-        return self.comp_head(attr_embed, obj_embed)
+        visual_vec = F.normalize(visual_embeds.mean(dim=(1, 2)), dim=-1)  # (B, 1024)
+        return self.comp_head(attr_embed, obj_embed, visual_vec)
 
 
 # ----------------------------------------------------------------------

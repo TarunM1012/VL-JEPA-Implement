@@ -25,6 +25,7 @@ import sys
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -237,9 +238,10 @@ def main() -> None:
             patch_tokens = visual_encoder(clips)               # (B, F, P, 1024)
 
             # Step 2 — Per-primitive predictions in the shared embedding space.
-            attr_pred = primitive_heads.forward_attribute(patch_tokens)  # (B, 1536)
-            obj_pred  = primitive_heads.forward_object(patch_tokens)     # (B, 1536)
-            comp_pred = primitive_heads.compose(attr_pred, obj_pred)     # (B, 1536)
+            attr_pred  = primitive_heads.forward_attribute(patch_tokens)  # (B, 1536)
+            obj_pred   = primitive_heads.forward_object(patch_tokens)     # (B, 1536)
+            visual_vec = F.normalize(patch_tokens.mean(dim=(1, 2)), dim=-1)  # (B, 1024)
+            comp_pred  = primitive_heads.compose(attr_pred, obj_pred, visual_vec)  # (B, 1536)
 
             # Step 3 — Three-branch λ-weighted base scores (no γ yet).
             sims = (

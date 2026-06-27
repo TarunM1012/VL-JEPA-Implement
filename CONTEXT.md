@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-Reproducing VL-JEPA (arXiv:2512.10942) and repurposing it for Compositional Zero-Shot Learning (CZSL), under Prof. Faisal Qureshi at Ontario Tech University. Long-term goal is integration with labmate Alan's continual learning work toward a Compositional Continual Zero-Shot Learning (CCZSL) system, targeting a workshop paper around September, with a possible top-tier conference submission for the combined CCZSL work.
+Reproducing VL-JEPA (arXiv:2512.10942) and repurposing it for Compositional Zero-Shot Learning (CZSL), under Prof. Faisal Qureshi at Ontario Tech University. Long-term goal is work toward a Compositional Zero-Shot Learning (CZSL) system, targeting a workshop paper around September, with a possible top-tier conference submission for the combined CZSL work.
 
 The original VL-JEPA paper used DataComp for large-scale image-text pretraining with a predictive (non-contrastive) objective. We swapped to MIT-States because CZSL evaluation requires structured attribute-object pair data, which DataComp does not provide.
 
@@ -241,6 +241,6 @@ Best val_loss of 1.4368 at epoch 4 — the lowest val_loss observed across the e
 
 **Open questions (pending Faisal input):**
 1. Backbone swap (V-JEPA 2 → CLIP) — not being pursued, remains open
-2. CCZSL multi-session reformatting with Alan — not being pursued, current focus is single-session CZSL
 
-**Relevant prior lab work:** PromptCCZSL (IJCAI 2024 + Dec 2025 follow-up) — soft prompt learning on frozen CLIP for continual compositional ZSL. Three-branch inference scoring in that paper directly inspired this project's eval protocol. Most likely template for eventual CCZSL integration with Alan's work.
+
+**Relevant prior lab work:** PromptCCZSL (IJCAI 2024 + Dec 2025 follow-up) — soft prompt learning on frozen CLIP for continual compositional ZSL. Three-branch inference scoring in that paper directly inspired this project's eval protocol.

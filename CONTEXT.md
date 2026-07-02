@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-Reproducing VL-JEPA (arXiv:2512.10942) and repurposing it for Compositional Zero-Shot Learning (CZSL), under Prof. Faisal Qureshi at Ontario Tech University. Long-term goal is work toward a Compositional Zero-Shot Learning (CZSL) system, targeting a workshop paper around September, with a possible top-tier conference submission for the combined CZSL work.
+Reproducing VL-JEPA (arXiv:2512.10942) and repurposing it for Compositional Zero-Shot Learning (CZSL), under Prof. Faisal Qureshi at Ontario Tech University. Long-term goal is integration with labmate Alan's continual learning work toward a Compositional Continual Zero-Shot Learning (CCZSL) system, targeting a workshop paper around September, with a possible top-tier conference submission for the combined CCZSL work.
 
 The original VL-JEPA paper used DataComp for large-scale image-text pretraining with a predictive (non-contrastive) objective. We swapped to MIT-States because CZSL evaluation requires structured attribute-object pair data, which DataComp does not provide.
 
@@ -121,7 +121,7 @@ Best val_loss of 1.4368 at epoch 4 — the lowest val_loss observed across the e
 **Predictor (v2r1 onward):** Three lightweight heads replacing the old LLaMA 3.2-1B predictor:
 - AttributeHead: 4-layer bidirectional transformer encoder, hidden=512, 8 heads, FFN=2048, mean-pool → Linear(512→1536) → L2-norm. ~13.92M params.
 - ObjectHead: identical architecture. ~13.92M params.
-- CompositionHead: 3-layer MLP, concat(attr_embed, obj_embed) → Linear(3072→1536) → GELU → Linear(1536→1536) → GELU → Linear(1536→1536) → L2-norm. ~9.44M params. Runs attr/obj heads under torch.no_grad() so comp-batch gradients are isolated.
+- CompositionHead (v2r2r1 onward): 3-layer MLP, concat(attr_embed, obj_embed, visual_vec) → Linear(4608→1536) → GELU → Linear(1536→1536) → GELU → Linear(1536→1536) → L2-norm. visual_vec = mean-pool(patch_tokens, dims F+P) → L2-norm → (B, 1024). Runs attr/obj heads under torch.no_grad() so comp-batch gradients are isolated.
 - Total: ~37.28M trainable params.
 
 **Loss:** Bidirectional symmetric InfoNCE with learnable temperature (init τ=0.07, clamped). Computed independently per head per step — attr-batches only update the attr head, obj-batches only update obj head, comp-batches only update composition head.
@@ -192,6 +192,27 @@ Best val_loss of 1.4368 at epoch 4 — the lowest val_loss observed across the e
 - **Official result:** Seen 10.17% / Unseen 12.07% / HM 11.04% (calibrated, γ=0.11 from val, AUC=0.0265)
 - **Status:** First properly-protocolled result. Architecture established, v2r2 series underway.
 
+### v2r2r1 — `v2r2r1-composition-visual-grounding` — Visual Tokens into Composition Head
+- **Change:** Gave composition head direct access to mean-pooled V-JEPA patch tokens alongside attr+obj embeddings. Input dim: 3072 → 4608 (concat of attr_embed 1536 + obj_embed 1536 + visual_vec 1024). Motivated by CPF (2025) and Troika (CVPR 2024) which both show composition-path visual grounding fixes the "noisy upstream embeddings → weak composition" failure mode.
+- **Training dynamics (per-epoch val loss):**
+
+| Epoch | val_loss | attr  | obj   | comp  |
+|-------|----------|-------|-------|-------|
+| 1     | 1.6937   | 2.18  | 1.45  | 1.45  |
+| 2     | 1.5593   | 2.11  | 1.29  | 1.28  |
+| 3     | 1.4671   | 2.05  | 1.19  | 1.16  |
+| **4** | **1.4316** | **2.02** | **1.16** | **1.12** |
+| 5     | 1.4393   | 2.08  | 1.16  | 1.07  |
+| 6     | 1.4532   | 2.15  | 1.14  | 1.07  |
+| 7     | 1.5002   | 2.26  | 1.14  | 1.10  |
+| 8     | 1.5236   | 2.31  | 1.15  | 1.11  |
+| 9     | 1.5591   | 2.36  | 1.20  | 1.12  |
+| 10    | 1.6271   | 2.50  | 1.22  | 1.16  |
+
+- **Official result:** Seen 10.77% / Unseen 12.75% / HM 11.68% (calibrated, γ=0.11 from val, AUC=0.0344)
+- **Val sweep result:** Best HM 13.54% at γ=0.11 (Seen=12.62%, Unseen=14.60%), AUC=0.0344
+- **Diagnosis:** Small but real improvement over v2r1 (+0.64% HM, +0.68% unseen, AUC +0.0079). Val loss improved marginally for comp head (1.1354 → 1.1227 at epoch 4). The change is directionally correct but not a dramatic fix — the bottleneck is not purely composition-head blindness. Attr head val loss pattern is essentially unchanged (2.01 → 2.02 at epoch 4), confirming attr head quality is the next lever to pull.
+
 ---
 
 ## Key Findings (Cross-Run)
@@ -208,7 +229,7 @@ Best val_loss of 1.4368 at epoch 4 — the lowest val_loss observed across the e
 
 6. **V-JEPA features don't disentangle attribute from object.** This is the fundamental challenge — the frozen backbone treats pairs atomically. The three-head architecture + structured batching is the best available workaround without fine-tuning.
 
-7. **Composition head blindness is the current bottleneck.** It sees only attr+obj embeddings, never raw visual tokens. v2r2r1 fixes this directly.
+7. **Composition head blindness was a bottleneck but not the only one.** v2r2r1 gave it raw visual tokens — small improvement (+0.64% HM) but not dramatic. Attr head quality (val loss persistently ~2x higher than obj) is the next lever.
 
 ---
 
@@ -229,18 +250,24 @@ Best val_loss of 1.4368 at epoch 4 — the lowest val_loss observed across the e
 
 ## Current Status (as of June 2026)
 
-**Official best result:** v2r1 calibrated → Seen 10.17% / Unseen 12.07% / HM 11.04% / AUC 0.0265 (γ=0.11 from val, three-branch λc=1.0/λa=0.5/λo=0.5, test set).
+**Ablation table (all calibrated, γ=0.11 from val, applied to test):**
 
-**Baselines to beat (CLIP-free tier, calibrated HM):** CompCos ~16%, COT ~25%, CPF ~26%. Current gap: ~1.5x below weakest CLIP-free baseline. Note: previously quoted baselines (CoT ~17%, CompCos ~25%, CAPE ~33%) appear to be seen-accuracy numbers, not HM — corrected here.
+| Run | Change | Seen | Unseen | HM | AUC |
+|-----|--------|------|--------|-----|-----|
+| v2r1 | three heads + primitive batching | 10.17% | 12.07% | 11.04% | 0.0265 |
+| v2r2r1 | + visual tokens into composition | 10.77% | 12.75% | 11.68% | 0.0344 |
+| v2r2r2 | + object-conditioning on attr head | TBD | TBD | TBD | TBD |
+| v2r2r3 | + attr loss upweighting 1.5:1.0:1.0 | TBD | TBD | TBD | TBD |
+| v2r2r4 | + CSP soft prompts on Y-encoder | TBD | TBD | TBD | TBD |
 
-**Active work:** v2r2 series, one change per run:
-- v2r2r1: raw visual tokens into composition head
-- v2r2r2: object-conditioning on attribute head (FiLM)
-- v2r2r3: attribute loss upweighting 1.5:1.0:1.0
-- v2r2r4: CSP-style soft prompts on Y-encoder targets
+**Official best result:** v2r2r1 calibrated → Seen 10.77% / Unseen 12.75% / HM 11.68% / AUC 0.0344 (γ=0.11 from val, three-branch λc=1.0/λa=0.5/λo=0.5, test set).
+
+**Baselines to beat (CLIP-free tier, calibrated HM):** CompCos ~16%, COT ~25%, CPF ~26%. Current gap: ~1.4x below weakest CLIP-free baseline. Note: previously quoted baselines (CoT ~17%, CompCos ~25%, CAPE ~33%) appear to be seen-accuracy numbers, not HM — corrected here.
+
+**Active work:** v2r2r2 — object-conditioning on attribute head via FiLM (CANet/CPF/COT precedent). This is the highest-priority remaining change given attr head val loss is persistently ~2x higher than obj across all runs.
 
 **Open questions (pending Faisal input):**
 1. Backbone swap (V-JEPA 2 → CLIP) — not being pursued, remains open
+2. CCZSL multi-session reformatting with Alan — not being pursued, current focus is single-session CZSL
 
-
-**Relevant prior lab work:** PromptCCZSL (IJCAI 2024 + Dec 2025 follow-up) — soft prompt learning on frozen CLIP for continual compositional ZSL. Three-branch inference scoring in that paper directly inspired this project's eval protocol.
+**Relevant prior lab work:** PromptCCZSL (IJCAI 2024 + Dec 2025 follow-up) — soft prompt learning on frozen CLIP for continual compositional ZSL. Three-branch inference scoring in that paper directly inspired this project's eval protocol. Most likely template for eventual CCZSL integration with Alan's work.

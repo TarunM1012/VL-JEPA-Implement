@@ -270,6 +270,36 @@ class CompositionHead(nn.Module):
 
 
 # ----------------------------------------------------------------------
+# Optimiser param-group splitting (decay vs. no-decay)
+# ----------------------------------------------------------------------
+
+def _split_decay_params(module: nn.Module) -> tuple[List[nn.Parameter], List[nn.Parameter]]:
+    """
+    Split a module's parameters into (decay, no_decay) groups for AdamW.
+
+    LayerNorm weight/bias and all Linear biases should not be weight-decayed:
+    decaying them pulls the value toward zero for no principled reason,
+    fighting whatever the task loss is doing to it every step (same
+    rationale as not decaying the InfoNCE temperature). Matched by module
+    type (nn.LayerNorm) rather than name substring, since
+    nn.TransformerEncoderLayer names its norms "norm1"/"norm2", not
+    "LayerNorm" — a literal string match would miss them.
+    """
+    no_decay: List[nn.Parameter] = []
+    for m in module.modules():
+        if isinstance(m, nn.LayerNorm):
+            no_decay.extend(m.parameters())
+    no_decay_ids = {id(p) for p in no_decay}
+
+    decay: List[nn.Parameter] = []
+    for name, p in module.named_parameters():
+        if id(p) in no_decay_ids:
+            continue
+        (no_decay if name.endswith("bias") else decay).append(p)
+    return decay, no_decay
+
+
+# ----------------------------------------------------------------------
 # Container
 # ----------------------------------------------------------------------
 
@@ -352,14 +382,21 @@ class PrimitiveHeads(nn.Module):
 
     def param_groups(self, base_lr: float) -> List[dict]:
         """
-        One param group per head, all at the full base LR.  These heads are
-        trained from scratch (unlike the Y-encoder projection, which sits on a
-        frozen backbone and uses a reduced LR), so no LR multiplier is applied.
+        Two param groups — decay and no-decay — spanning all three heads.
+        LayerNorm weight/bias and all Linear biases are excluded from weight
+        decay (see `_split_decay_params`); everything else decays normally
+        via the optimiser's global weight_decay. All heads are trained from
+        scratch (unlike the Y-encoder projection, which sits on a frozen
+        backbone and uses a reduced LR), so no LR multiplier is applied.
         """
+        decay, no_decay = [], []
+        for head in (self.attr_head, self.obj_head, self.comp_head):
+            head_decay, head_no_decay = _split_decay_params(head)
+            decay += head_decay
+            no_decay += head_no_decay
         return [
-            {"params": self.attr_head.parameters(), "lr": base_lr},
-            {"params": self.obj_head.parameters(),  "lr": base_lr},
-            {"params": self.comp_head.parameters(), "lr": base_lr},
+            {"params": decay, "lr": base_lr},
+            {"params": no_decay, "lr": base_lr, "weight_decay": 0.0},
         ]
 
     # ---- Forward entry points ---------------------------------------------

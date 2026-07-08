@@ -208,7 +208,7 @@ def main() -> None:
     optimizer = torch.optim.AdamW(
         primitive_heads.param_groups(base_lr=args.lr)
         + y_encoder.param_groups(base_lr=args.lr)
-        + [{"params": loss_fn.parameters(), "lr": args.lr}],
+        + [{"params": loss_fn.parameters(), "lr": args.lr, "weight_decay": 0.0}],
         weight_decay=0.05,
     )
 
@@ -252,6 +252,10 @@ def main() -> None:
             # Step 3 — Bidirectional InfoNCE loss, computed per head
             loss = loss_fn(pred_embeds, target_embeds)
 
+            # v2r2r3: upweight attr head loss (1.5:1.0:1.0, attr:obj:comp)
+            if batch_type == "attr":
+                loss = loss * 1.5
+
             # Step 4 — Backprop (updates only the routed head + Y-encoder head)
             optimizer.zero_grad()
             loss.backward()
@@ -261,7 +265,7 @@ def main() -> None:
 
             if global_step % 10 == 0:
                 logger.info(
-                    "epoch=%d  step=%d  type=%-4s  loss=%.4f  tau=%.4f",
+                    "epoch=%d  step=%d  type=%-4s  weighted_loss=%.4f  tau=%.4f",
                     epoch + 1, global_step, batch_type,
                     loss.item(), loss_fn.tau.item(),
                 )
@@ -293,7 +297,7 @@ def main() -> None:
         y_encoder.eval()
         val_loss_sum = {"attr": 0.0, "obj": 0.0, "comp": 0.0}
         val_steps    = {"attr": 0,   "obj": 0,   "comp": 0}
-        val_loader.set_epoch(epoch)
+        val_loader.set_epoch(0)  # fixed arrangement — val loss stays comparable across epochs
 
         with torch.no_grad():
             for clips, texts, batch_type in val_loader:

@@ -4,8 +4,8 @@ CZSL evaluation for VL-JEPA on MIT-States.
 Protocol
 --------
 1. Pre-compute y_encoder embeddings for every (attr, obj) pair in the
-   vocabulary, in three banks: attribute-only Y("attr"), object-only Y("obj"),
-   and full-composition Y("attr obj").
+   closed-world candidate set, in three banks: attribute-only Y("attr"),
+   object-only Y("obj"), and full-composition Y("attr obj").
 2. For each test image, run visual_encoder once, then the three primitive
    heads to produce attribute, object, and composition predictions in the
    shared embedding space.  The composition prediction fuses the attr/obj
@@ -16,6 +16,10 @@ Protocol
 
 Seen / unseen split: pairs listed in train_pairs.txt are "seen"; all other
 vocabulary pairs (val + test only) are "unseen".
+
+Candidate set (closed-world): train_pairs ∪ phase_pairs (NOT the full 1962-pair
+vocab). For test: 1262 seen + 400 unseen = 1662 pairs. For val: 1262 seen +
+300 unseen = 1562 pairs. This matches the standard published protocol.
 """
 from __future__ import annotations
 
@@ -112,8 +116,6 @@ def load_models(
     y_encoder.eval()
 
     logger.info("Building PrimitiveHeads …")
-    # Rebuild with the exact architecture used at train time when the
-    # checkpoint records it; fall back to defaults for older checkpoints.
     head_config = state.get("head_config") or {}
     primitive_heads = PrimitiveHeads.build(device=device, **head_config)
     primitive_heads.load_state_dict(state["primitive_heads"])
@@ -138,23 +140,20 @@ def encode_all_pairs(
         attr bank : Y("attr")        — attribute word alone
         obj  bank : Y("obj")         — object word alone
         comp bank : Y("attr obj")    — the full composition phrase
-
-    The composition bank is the Y-encoder embedding of the full phrase (NOT a
-    sum of attr+obj), consistent with how the composition head is trained.
     """
-    attrs  = [attr           for attr, obj in pairs]
-    objs   = [obj            for attr, obj in pairs]
+    attrs   = [attr            for attr, obj in pairs]
+    objs    = [obj             for attr, obj in pairs]
     phrases = [f"{attr} {obj}" for attr, obj in pairs]
     attr_chunks, obj_chunks, comp_chunks = [], [], []
     for i in range(0, len(attrs), batch_size):
-        ae = y_encoder(attrs[i   : i + batch_size])          # (B, 1536) = Y("attr")
-        oe = y_encoder(objs[i    : i + batch_size])          # (B, 1536) = Y("obj")
-        ce = y_encoder(phrases[i : i + batch_size])          # (B, 1536) = Y("attr obj")
+        ae = y_encoder(attrs[i   : i + batch_size])
+        oe = y_encoder(objs[i    : i + batch_size])
+        ce = y_encoder(phrases[i : i + batch_size])
         attr_chunks.append(ae.cpu())
         obj_chunks.append(oe.cpu())
         comp_chunks.append(ce.cpu())
     return (
-        torch.cat(attr_chunks, dim=0),   # (num_pairs, 1536)
+        torch.cat(attr_chunks, dim=0),
         torch.cat(obj_chunks,  dim=0),
         torch.cat(comp_chunks, dim=0),
     )
@@ -174,19 +173,70 @@ def main() -> None:
         images_root=args.data_root,
         splits_root=args.split_root,
     )
+
     # Seen pairs = those that appear in the training split file.
     seen_pairs: set[tuple[str, str]] = set(
         _load_pairs(Path(args.split_root) / "train_pairs.txt")
     )
 
-    num_seen_vocab   = sum(1 for p in test_dataset.pairs if p in seen_pairs)
-    num_unseen_vocab = sum(1 for p in test_dataset.pairs if p not in seen_pairs)
-    logger.info(
-        "%s samples: %d | Vocabulary: %d pairs (%d seen, %d unseen)",
-        args.phase.capitalize(),
-        len(test_dataset), len(test_dataset.pairs),
-        num_seen_vocab, num_unseen_vocab,
+    # Closed-world candidate set = seen (train) pairs + THIS phase's pairs.
+    # NOT the full 1962-pair vocab — the other phase's unseen pairs are
+    # distractors that inflate difficulty and break comparability with
+    # published numbers.
+    # test → 1262 seen + 400 unseen = 1662 pairs
+    # val  → 1262 seen + 300 unseen = 1562 pairs
+    phase_pairs: set[tuple[str, str]] = set(
+        _load_pairs(Path(args.split_root) / f"{args.phase}_pairs.txt")
     )
+    candidate_pairs = sorted(seen_pairs | phase_pairs)
+    cand2idx = {p: i for i, p in enumerate(candidate_pairs)}
+
+    _n_seen   = sum(1 for p in candidate_pairs if p in seen_pairs)
+    _n_unseen = len(candidate_pairs) - _n_seen
+    logger.info(
+        "Candidate set: %d pairs (%d seen + %d unseen) for phase=%s",
+        len(candidate_pairs), _n_seen, _n_unseen, args.phase,
+    )
+    _expected = {"test": 1662, "val": 1562}
+    if args.phase in _expected and len(candidate_pairs) != _expected[args.phase]:
+        raise RuntimeError(
+            f"Candidate set size {len(candidate_pairs)} != expected "
+            f"{_expected[args.phase]} for phase={args.phase}. "
+            f"Verify split files at {args.split_root}."
+        )
+
+    logger.info("%s samples: %d", args.phase.capitalize(), len(test_dataset))
+
+    # ── Models ────────────────────────────────────────────────────────────────
+    visual_encoder, y_encoder, primitive_heads = load_models(
+        Path(args.checkpoint), device
+    )
+
+    # ── Pre-compute three embedding banks over the candidate set ──────────────
+    logger.info("Encoding %d pair texts via y_encoder …", len(candidate_pairs))
+    attr_embeds_bank, obj_embeds_bank, comp_embeds_bank = encode_all_pairs(
+        y_encoder, candidate_pairs, args.batch_size, device
+    )
+    attr_embeds_bank = attr_embeds_bank.to(device)   # (num_candidates, 1536)
+    obj_embeds_bank  = obj_embeds_bank.to(device)
+    comp_embeds_bank = comp_embeds_bank.to(device)
+
+    logger.info(
+        "Scoring weights: λc=%.2f  λa=%.2f  λo=%.2f",
+        args.lambda_c, args.lambda_a, args.lambda_o,
+    )
+
+    # Boolean mask: True for candidate pairs that are seen (in train split).
+    seen_mask = torch.tensor(
+        [p in seen_pairs for p in candidate_pairs],
+        dtype=torch.bool, device=device,
+    )                                        # (num_candidates,)
+
+    # ── Evaluation loop ───────────────────────────────────────────────────────
+    # Collect per-image ground-truth indices and base scores so the
+    # γ sweep can reuse them without re-running the visual encoder.
+    all_scores:    list[torch.Tensor] = []   # each (B, num_candidates) on CPU
+    all_pair_idxs: list[torch.Tensor] = []   # each (B,) on CPU — vocab-space
 
     test_loader = DataLoader(
         test_dataset,
@@ -196,43 +246,12 @@ def main() -> None:
         pin_memory=True,
     )
 
-    # ── Models ────────────────────────────────────────────────────────────────
-    visual_encoder, y_encoder, primitive_heads = load_models(
-        Path(args.checkpoint), device
-    )
-
-    # ── Pre-compute three embedding banks ────────────────────────────────────
-    logger.info("Encoding %d pair texts via y_encoder …", len(test_dataset.pairs))
-    attr_embeds_bank, obj_embeds_bank, comp_embeds_bank = encode_all_pairs(
-        y_encoder, test_dataset.pairs, args.batch_size, device
-    )
-    attr_embeds_bank = attr_embeds_bank.to(device)   # (num_pairs, 1536)
-    obj_embeds_bank  = obj_embeds_bank.to(device)
-    comp_embeds_bank = comp_embeds_bank.to(device)
-
-    logger.info(
-        "Scoring weights: λc=%.2f  λa=%.2f  λo=%.2f",
-        args.lambda_c, args.lambda_a, args.lambda_o,
-    )
-
-    # Boolean mask: True for pairs present in the training split.
-    seen_mask = torch.tensor(
-        [p in seen_pairs for p in test_dataset.pairs],
-        dtype=torch.bool, device=device,
-    )                                        # (num_pairs,)
-
-    # ── Evaluation loop ───────────────────────────────────────────────────────
-    # Always collect per-image ground-truth indices and base scores so the
-    # γ sweep can reuse them without re-running the visual encoder.
-    all_scores:    list[torch.Tensor] = []   # each (B, num_pairs) on CPU
-    all_pair_idxs: list[torch.Tensor] = []   # each (B,) on CPU
-
     with torch.no_grad():
         for batch_idx, (clips, _texts, _attr_idxs, _obj_idxs, pair_idxs) in enumerate(
             test_loader
         ):
             clips     = clips.to(device, non_blocking=True)   # (B, F, C, H, W)
-            pair_idxs = pair_idxs.to(device)                  # (B,)
+            pair_idxs = pair_idxs.to(device)                  # (B,) vocab-space
 
             # Step 1 — Visual encoding (shared by all three heads).
             patch_tokens = visual_encoder(clips)               # (B, F, P, 1024)
@@ -243,12 +262,12 @@ def main() -> None:
             visual_vec = F.normalize(patch_tokens.mean(dim=(1, 2)), dim=-1)  # (B, 1024)
             comp_pred  = primitive_heads.compose(attr_pred, obj_pred, visual_vec)  # (B, 1536)
 
-            # Step 3 — Three-branch λ-weighted base scores (no γ yet).
+            # Step 3 — Three-branch λ-weighted base scores against candidate set.
             sims = (
                 args.lambda_c * (comp_pred @ comp_embeds_bank.T)
               + args.lambda_a * (attr_pred @ attr_embeds_bank.T)
               + args.lambda_o * (obj_pred  @ obj_embeds_bank.T)
-            )                                                  # (B, num_pairs)
+            )                                                  # (B, num_candidates)
 
             all_scores.append(sims.cpu())
             all_pair_idxs.append(pair_idxs.cpu())
@@ -259,25 +278,34 @@ def main() -> None:
                     batch_idx + 1, len(test_loader),
                 )
 
-    # (N_test, num_pairs) base score matrix — built once, reused for every γ.
-    base_scores = torch.cat(all_scores,    dim=0)   # (N_test, num_pairs)
-    gt_indices  = torch.cat(all_pair_idxs, dim=0)   # (N_test,)
+    # (N_test, num_candidates) base score matrix — built once, reused for γ sweep.
+    base_scores = torch.cat(all_scores,    dim=0)   # (N_test, num_candidates)
+    gt_indices  = torch.cat(all_pair_idxs, dim=0)   # (N_test,) — vocab-space
 
-    # Boolean GT membership: True when the ground-truth pair is seen/unseen.
+    # Remap ground-truth indices from full vocab-space into candidate-set space.
+    # pair_idxs from the dataset indexes into the full 1962-pair vocab;
+    # our score matrix is num_candidates wide, so we must remap before argmax.
+    gt_cand_idx = torch.tensor(
+        [cand2idx[test_dataset.pairs[i]] for i in gt_indices.tolist()],
+        dtype=torch.long,
+    )                                                # (N_test,) — candidate-space
+
+    # Boolean GT membership: True when the ground-truth pair is seen.
     gt_is_seen = torch.tensor(
         [test_dataset.pairs[i] in seen_pairs for i in gt_indices.tolist()],
         dtype=torch.bool,
     )                                                # (N_test,)
-    seen_mask_cpu = seen_mask.cpu()                  # (num_pairs,) — for γ offset
+
+    seen_mask_cpu = seen_mask.cpu()                  # (num_candidates,) — for γ offset
 
     # ── Helper: accuracy at a given score matrix ──────────────────────────────
     def _accuracy(scores: torch.Tensor) -> tuple[float, float]:
         if not args.gamma_sweep and args.gamma != 0.0:
             scores = scores + args.gamma * (~seen_mask_cpu).float().unsqueeze(0)
-        preds   = scores.argmax(dim=1)               # (N_test,)
-        correct = preds == gt_indices                # (N_test,)
-        s_acc = correct[gt_is_seen].float().mean().item()  if gt_is_seen.any()  else 0.0
-        u_acc = correct[~gt_is_seen].float().mean().item() if (~gt_is_seen).any() else 0.0
+        preds   = scores.argmax(dim=1)               # (N_test,) — candidate-space
+        correct = preds == gt_cand_idx               # (N_test,) — remapped GT
+        s_acc = correct[gt_is_seen].float().mean().item()   if gt_is_seen.any()   else 0.0
+        u_acc = correct[~gt_is_seen].float().mean().item()  if (~gt_is_seen).any() else 0.0
         return s_acc, u_acc
 
     def _hm(s: float, u: float) -> float:
@@ -301,10 +329,10 @@ def main() -> None:
         return
 
     # ── Calibration γ sweep ───────────────────────────────────────────────────
-    gammas = torch.linspace(-2.0, 2.0, 20).tolist()
+    gammas = torch.linspace(-3.0, 3.0, 50).tolist()
     rows: list[tuple[float, float, float, float]] = []  # (γ, seen, unseen, hm)
 
-    unseen_mask_cpu = ~seen_mask_cpu  # columns to offset
+    unseen_mask_cpu = ~seen_mask_cpu  # candidate columns to offset
     for gamma in gammas:
         scores = base_scores.clone()
         scores[:, unseen_mask_cpu] += gamma
@@ -314,9 +342,9 @@ def main() -> None:
     best = max(rows, key=lambda r: r[3])
 
     # AUC: trapezoidal area under the seen-vs-unseen curve, sorted by unseen_acc.
-    pts = sorted(rows, key=lambda r: r[2])           # sort by unseen_acc
-    xs  = [r[2] for r in pts]                        # unseen axis
-    ys  = [r[1] for r in pts]                        # seen axis
+    pts = sorted(rows, key=lambda r: r[2])
+    xs  = [r[2] for r in pts]   # unseen axis
+    ys  = [r[1] for r in pts]   # seen axis
     auc = float(torch.trapezoid(torch.tensor(ys), torch.tensor(xs)).abs())
 
     # ── Print summary table ───────────────────────────────────────────────────
@@ -331,7 +359,7 @@ def main() -> None:
         marker = "  ← best" if (gamma, s, u, h) == best else ""
         print(f"  {gamma:>6.2f}   {s*100:>7.2f}%   {u*100:>7.2f}%   {h*100:>7.2f}%{marker}")
     print("=" * W)
-    print(f"  AUC: {auc:.4f}")
+    print(f"  AUC: {auc * 100:.2f}%")
     print(f"  Best HM: {best[3]*100:.2f}%  at γ={best[0]:.2f}")
     print(f"  (Seen={best[1]*100:.2f}%, Unseen={best[2]*100:.2f}%)")
     print(f"  λc={args.lambda_c}  λa={args.lambda_a}  λo={args.lambda_o}")

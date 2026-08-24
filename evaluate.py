@@ -117,6 +117,7 @@ def load_models(
 
     logger.info("Building PrimitiveHeads …")
     head_config = state.get("head_config") or {}
+    head_config.setdefault("use_visual_in_comp", False)
     primitive_heads = PrimitiveHeads.build(device=device, **head_config)
     primitive_heads.load_state_dict(state["primitive_heads"])
     primitive_heads.eval()

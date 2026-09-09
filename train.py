@@ -12,10 +12,11 @@ type, routed by `RoutingDataLoader` (see data/primitive_sampler.py):
 
 Pipeline per batch
 ------------------
-clips (B, F, C, H, W)  ──►  VisualEncoder  ──►  patch tokens (B, F, P, 1024)
-texts List[str]        ──►  YEncoder       ──►  target embeds (B, 1536)
-patch tokens           ──►  one head       ──►  pred embeds   (B, 1536)
-pred + target          ──►  InfoNCELoss    ──►  scalar loss (backprop one head)
+images (B, C, H, W)    ──►  CLIPEncoder.get_visual_features
+                        ──►  patch tokens (B, P, 1024)
+texts List[str]        ──►  CLIPEncoder.get_text_features   ──►  target embeds (B, 768)
+patch tokens           ──►  one head                        ──►  pred embeds   (B, 768)
+pred + target          ──►  InfoNCELoss                     ──►  scalar loss (backprop one head)
 """
 
 import argparse
@@ -25,15 +26,15 @@ from pathlib import Path
 import os
 
 import torch
+import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).parent))
 
 from data.mit_states import MITStates as MITStatesDataset
 from data.primitive_sampler import RoutingDataLoader
+from models.clip_encoder import CLIPEncoder
 from models.loss import InfoNCELoss
 from models.primitive_heads import PrimitiveHeads
-from models.visual_encoder import VisualEncoder
-from models.y_encoder import YEncoder
 
 logging.basicConfig(
     level=logging.INFO,
@@ -53,8 +54,6 @@ def parse_args() -> argparse.Namespace:
                         help="samples per gradient step")
     parser.add_argument("--lr",         type=float, default=5e-5,
                         help="base learning rate for AdamW")
-    parser.add_argument("--num_frames", type=int,   default=2,
-                        help="frames per clip (MIT-States repeats the image)")
     parser.add_argument("--seed",       type=int,   default=0,
                         help="base RNG seed for the primitive batch sampler")
     # ── Primitive-head architecture (attr/obj transformer heads) ──
@@ -87,20 +86,23 @@ CKPT_DIR = Path(os.environ.get("CHECKPOINT_DIR", "checkpoints"))
 def save_checkpoint(
     step: int,
     epoch: int,
-    visual_encoder: VisualEncoder,
-    y_encoder: YEncoder,
     primitive_heads: PrimitiveHeads,
     loss_fn: InfoNCELoss,
     optimizer: torch.optim.Optimizer,
 ) -> None:
-    """Save all model state dicts, optimizer state, and training position."""
+    """
+    Save trainable state dicts, optimizer state, and training position.
+
+    CLIP is entirely frozen with no trainable parameters, so its weights are
+    not checkpointed — CLIPEncoder.load_pretrained() deterministically
+    reproduces the same backbone at eval/resume time, and skipping it avoids
+    duplicating a ~900 MB frozen model into every checkpoint file.
+    """
     CKPT_DIR.mkdir(exist_ok=True)
 
     state = {
         "step":            step,
         "epoch":           epoch,
-        "visual_encoder":  visual_encoder.state_dict(),
-        "y_encoder":       y_encoder.state_dict(),
         "primitive_heads": primitive_heads.state_dict(),
         "head_config":     primitive_heads.config,
         "loss_fn":         loss_fn.state_dict(),
@@ -117,8 +119,6 @@ def save_checkpoint(
 
 
 def load_checkpoint(
-    visual_encoder: VisualEncoder,
-    y_encoder: YEncoder,
     primitive_heads: PrimitiveHeads,
     loss_fn: InfoNCELoss,
     optimizer: torch.optim.Optimizer,
@@ -131,8 +131,6 @@ def load_checkpoint(
     logger.info("Loading checkpoint from %s", latest)
     state = torch.load(latest, map_location="cpu")
 
-    visual_encoder.load_state_dict(state["visual_encoder"])
-    y_encoder.load_state_dict(state["y_encoder"])
     primitive_heads.load_state_dict(state["primitive_heads"])
     loss_fn.load_state_dict(state["loss_fn"])
     optimizer.load_state_dict(state["optimizer"])
@@ -148,16 +146,23 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info("Device: %s", device)
 
+    # ── Models ────────────────────────────────────────────────────────────────
+    logger.info("Loading CLIPEncoder …")
+    clip_encoder = CLIPEncoder.load_pretrained(device=device)
+    clip_encoder.eval()
+
     # ── Datasets and DataLoaders ───────────────────────────────────────────────
+    # Images are preprocessed with CLIP's own transform (encoder.preprocess)
+    # so pixel statistics match what the frozen visual tower expects.
     train_dataset = MITStatesDataset(
+        transform=clip_encoder.preprocess,
         phase="train",
-        num_frames=args.num_frames,
         images_root=args.data_root,
         splits_root=args.split_root,
     )
     val_dataset = MITStatesDataset(
+        transform=clip_encoder.preprocess,
         phase="val",
-        num_frames=args.num_frames,
         images_root=args.data_root,
         splits_root=args.split_root,
     )
@@ -185,14 +190,6 @@ def main() -> None:
         seed=args.seed,
     )
 
-    # ── Models ────────────────────────────────────────────────────────────────
-    logger.info("Loading VisualEncoder …")
-    visual_encoder = VisualEncoder.load_pretrained(is_frozen=True).to(device)
-    visual_encoder.eval()
-
-    logger.info("Loading YEncoder …")
-    y_encoder = YEncoder.load_pretrained(device=device).to(device)
-
     logger.info("Building PrimitiveHeads …")
     primitive_heads = PrimitiveHeads.build(
         hidden_dim=args.head_hidden,
@@ -205,25 +202,25 @@ def main() -> None:
     loss_fn = InfoNCELoss().to(device)
 
     # ── Optimizer ─────────────────────────────────────────────────────────────
+    # CLIP is fully frozen (no trainable projection head, unlike the old
+    # Y-encoder), so its parameters contribute no param group here.
     optimizer = torch.optim.AdamW(
         primitive_heads.param_groups(base_lr=args.lr)
-        + y_encoder.param_groups(base_lr=args.lr)
         + [{"params": loss_fn.parameters(), "lr": args.lr, "weight_decay": 0.0}],
         weight_decay=0.05,
     )
 
     # ── Resume ────────────────────────────────────────────────────────────────
-    global_step, start_epoch = load_checkpoint(
-        visual_encoder, y_encoder, primitive_heads, loss_fn, optimizer
-    )
+    global_step, start_epoch = load_checkpoint(primitive_heads, loss_fn, optimizer)
 
     # ── Forward routing helper ──────────────────────────────────────────────
     # Returns (pred_embeds, target_embeds) for the head selected by batch_type.
     # `texts` already carries the mode-appropriate strings (attribute-only,
-    # object-only, or the full phrase), so the Y-encoder targets are correct
+    # object-only, or the full phrase), so the CLIP text targets are correct
     # for each head without any further splitting here.
     def forward_batch(batch_type, patch_tokens, texts):
-        target_embeds = y_encoder(texts)                       # (B, 1536)
+        with torch.no_grad():
+            target_embeds = F.normalize(clip_encoder.get_text_features(texts), dim=-1)  # (B, 768)
         if batch_type == "attr":
             pred = primitive_heads.forward_attribute(patch_tokens)
         elif batch_type == "obj":
@@ -236,15 +233,14 @@ def main() -> None:
     for epoch in range(start_epoch, args.epochs):
         logger.info("── Epoch %d / %d ──", epoch + 1, args.epochs)
         primitive_heads.train()
-        y_encoder.train()
         train_loader.set_epoch(epoch)
 
-        for clips, texts, batch_type in train_loader:
-            clips = clips.to(device, non_blocking=True)
+        for images, texts, batch_type in train_loader:
+            images = images.to(device, non_blocking=True)
 
             # Step 1 — Visual encoding (frozen, no grad)
             with torch.no_grad():
-                patch_tokens = visual_encoder(clips)   # (B, F, num_patches, 1024)
+                patch_tokens = clip_encoder.get_visual_features(images)   # (B, num_patches, 1024)
 
             # Step 2 — Route to the head for this batch type + encode targets
             pred_embeds, target_embeds = forward_batch(batch_type, patch_tokens, texts)
@@ -256,7 +252,7 @@ def main() -> None:
             if batch_type == "attr":
                 loss = loss * 1.5
 
-            # Step 4 — Backprop (updates only the routed head + Y-encoder head)
+            # Step 4 — Backprop (updates only the routed head)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -274,8 +270,6 @@ def main() -> None:
                 save_checkpoint(
                     step=global_step,
                     epoch=epoch,
-                    visual_encoder=visual_encoder,
-                    y_encoder=y_encoder,
                     primitive_heads=primitive_heads,
                     loss_fn=loss_fn,
                     optimizer=optimizer,
@@ -284,8 +278,6 @@ def main() -> None:
         save_checkpoint(
             step=global_step,
             epoch=epoch + 1,
-            visual_encoder=visual_encoder,
-            y_encoder=y_encoder,
             primitive_heads=primitive_heads,
             loss_fn=loss_fn,
             optimizer=optimizer,
@@ -294,15 +286,14 @@ def main() -> None:
         # ── Validation ────────────────────────────────────────────────────────
         # Track loss per batch type so each head's progress is visible.
         primitive_heads.eval()
-        y_encoder.eval()
         val_loss_sum = {"attr": 0.0, "obj": 0.0, "comp": 0.0}
         val_steps    = {"attr": 0,   "obj": 0,   "comp": 0}
         val_loader.set_epoch(0)  # fixed arrangement — val loss stays comparable across epochs
 
         with torch.no_grad():
-            for clips, texts, batch_type in val_loader:
-                clips        = clips.to(device, non_blocking=True)
-                patch_tokens = visual_encoder(clips)
+            for images, texts, batch_type in val_loader:
+                images       = images.to(device, non_blocking=True)
+                patch_tokens = clip_encoder.get_visual_features(images)
                 pred_embeds, target_embeds = forward_batch(batch_type, patch_tokens, texts)
                 val_loss_sum[batch_type] += loss_fn(pred_embeds, target_embeds).item()
                 val_steps[batch_type]    += 1

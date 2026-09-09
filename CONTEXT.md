@@ -24,11 +24,19 @@ Adapting the JEPA predictive (non-contrastive) training objective for Compositio
 
 **Target performance with CLIP backbone:** 39–42% closed-world HM on MIT-States. This puts the work between Troika (39.3%) and CAMS/EVA (41.0%) — competitive with 2024-2025 SOTA. Reaching 40%+ requires intermediate CLIP layer access (CAMS-style), not just final CLS token.
 
-**New branch:** `clip-backbone` off main. Dataset, sampler, evaluate.py, and three-branch scoring are backbone-agnostic and carry over unchanged.
+**Branch:** implemented on `v3-CLIP` (off main; plan originally named this `clip-backbone`). Dataset, sampler, evaluate.py, and three-branch scoring are backbone-agnostic and carried over largely unchanged (see status below for the one shared change — frame-axis removal).
+
+**Implementation status (2026-09-09): backbone swap complete, smoke-tested, not yet trained.** All of `models/clip_encoder.py` (new), `models/primitive_heads.py`, `train.py`, `evaluate.py`, and `data/mit_states.py` are rewritten for CLIP; see "Current Architecture (CLIP backbone)" below for the resulting design. Verification performed this session:
+- `tests/test_clip_smoke.py` (new): 10-sample forward pass, image → CLIP patch tokens → attr/obj/comp heads → 768-dim unit-norm embeddings, text → CLIP text features → 768-dim, InfoNCE loss computes cleanly. Run against real downloaded ViT-L/14 weights (skips gracefully if `clip` or the checkpoint isn't available).
+- `models/clip_encoder.py`'s hand-rolled visual-tower forward pass (patch tokens from the last transformer block, pre-projection) verified **bit-exact** (max abs diff 0.0) against CLIP's own `encode_image`/`encode_text` on random inputs.
+- Existing smoke tests (`primitive_heads.py`, `loss.py`, `primitive_sampler.py`) all still pass after the frame-axis removal.
+- Added the missing `openai/CLIP` GitHub install to `requirements.txt` — it was absent, so `pip install -r requirements.txt` would not have installed it.
+
+Not yet done: a real training run (explicitly out of scope for this pass — submitted via sbatch separately) and intermediate-layer (CAMS-style) access for the attr/obj heads, which the 40%+ HM target below still depends on.
 
 ---
 
-## Current Architecture (v2, V-JEPA 2 backbone — being replaced)
+## Previous Architecture (v2, V-JEPA 2 backbone — superseded, kept as ablation baseline)
 
 **Visual Encoder:** Frozen V-JEPA 2 ViT-L (`facebook/vjepa2-vitl-fpc64-256`). Patch tokens shape (B, F, num_patches, 1024). Images duplicated to 2 frames for video format compliance.
 
@@ -46,17 +54,26 @@ Adapting the JEPA predictive (non-contrastive) training objective for Compositio
 
 ---
 
-## Target Architecture (CLIP backbone — next branch)
+## Current Architecture (CLIP backbone, v3-CLIP branch — implemented, untrained)
 
-**Visual Encoder:** Frozen CLIP ViT-L/14 image encoder. Standard in all competitive CZSL methods. Provides CLS token + patch tokens with pretrained visual-semantic alignment.
+**Visual Encoder** (`models/clip_encoder.py`, new): Frozen CLIP ViT-L/14 image encoder, loaded via the `openai/CLIP` package (`clip.load("ViT-L/14", download_root=...)`) — **not** HuggingFace's `CLIPModel`. `get_visual_features(images)` returns patch tokens from the final transformer block, CLS token dropped, **before** CLIP's own `ln_post`/projection — shape `(B, num_patches, 1024)` (256 patches at 224px). Manually re-implements the visual-tower forward pass (conv1 → patchify → prepend CLS → add positional embedding → `ln_pre` → transformer) to intercept pre-projection features; verified bit-exact against `clip_model.encode_image()`'s own CLS path.
 
-**Text Encoder:** Frozen CLIP text encoder (matched to image encoder). Shared alignment space eliminates the cross-space learning burden.
+**Text Encoder** (same module): Frozen CLIP text encoder, `get_text_features(texts)` = `clip_model.encode_text(clip.tokenize(texts))` — CLIP's own projected output, shape `(B, 768)`. **Note:** the actual ViT-L/14 projected embedding dim is **768**, not 512 (512 is the ViT-B/32 and ViT-B/16 dim) — confirmed from the loaded checkpoint's `text_projection.shape`. All downstream dims below use 768.
 
-**Predictor:** Same three-head structure. Attr/obj heads receive CLIP patch tokens (and/or intermediate layer features). CompositionHead receives attr_embed + obj_embed + visual_vec (same as v2r2r1 pattern). Per-head InfoNCE against CLIP text encoder targets.
+**Predictor — same three-head structure, updated dims:**
+- AttributeHead / ObjectHead (`TransformerHead`): unchanged 4-layer bidirectional transformer, hidden=512, 8 heads, FFN=2048, mean-pool, ~13.53M params each. Input is now `(B, num_patches, 1024)` (no frame axis — see below); output `Linear(512→768)` → L2-norm.
+- CompositionHead: MLP taking `concat(attr_embed 768, obj_embed 768, visual_vec 1024)` = 2560 → `Linear(2560→768)` → GELU → `Linear(768→768)` → GELU → `Linear(768→768)` → L2-norm, ~3.15M params. Still runs attr/obj heads under `torch.no_grad()`.
+- Total trainable: ~30.2M params (down from ~37.3M in v2, since the shared embedding dim shrank 1536→768).
 
-**Key architectural decision for 40%+:** Intermediate CLIP layer access on attr/obj heads (CAMS precedent — last M transformer blocks via cross-attention with learnable latent queries). Final CLS token alone is insufficient for primitive disentanglement; lower layers carry more attribute-relevant local texture information.
+**Frame axis removed:** the `(B, F, C, H, W)` / `(B, F, P, D)` video-format axis — a V-JEPA 2 holdover, MIT-States images were duplicated across it — is gone entirely. `MITStates.__getitem__` returns a plain `(C, H, W)` image preprocessed with CLIP's own `preprocess` transform (injected via a required `transform` constructor arg, not built internally); `TransformerHead`/`CompositionHead` operate on `(B, P, D)` / `(B, D)` tensors directly; `train.py`/`evaluate.py` no longer flatten/unflatten a frame dim around `get_visual_features`.
 
-**What stays identical:** PrimitiveBatchSampler, evaluate.py, three-branch scoring (λc=1.0/λa=0.5/λo=0.5), γ-calibration protocol.
+**Loss:** Unchanged — bidirectional symmetric InfoNCE per head, learnable temperature τ. Dimension-agnostic (just cosine similarity + cross-entropy), so the 1536→768 shrink required no changes to `models/loss.py` itself.
+
+**Batch Sampler:** Unchanged — `PrimitiveBatchSampler` is agnostic to image shape/dim, only groups by (attr, obj) string keys.
+
+**Key architectural decision for 40%+ (not yet implemented):** Intermediate CLIP layer access on attr/obj heads (CAMS precedent — last M transformer blocks via cross-attention with learnable latent queries). Final-block patch tokens alone are what's implemented now; lower layers carrying more attribute-relevant local texture information is the next lever toward the 40%+ target.
+
+**What stayed identical:** `PrimitiveBatchSampler`, `evaluate.py`'s three-branch scoring (λc=1.0/λa=0.5/λo=0.5) and γ-calibration protocol, the per-head InfoNCE training loop structure in `train.py`.
 
 ---
 
@@ -166,14 +183,19 @@ Note: v2r2r2 (FiLM object-conditioning on attr head) was run but results not yet
 
 ## Repo Structure
 
-- `data/primitive_sampler.py` — PrimitiveBatchSampler + RoutingDataLoader (backbone-agnostic, carries over to CLIP branch)
-- `models/primitive_heads.py` — Three heads (will be rewritten for CLIP branch)
-- `train.py` — Training loop with per-head routing (will be updated for CLIP branch)
-- `evaluate.py` — Three-branch scoring + γ-calibration (backbone-agnostic, carries over)
+- `models/clip_encoder.py` — **New.** Frozen CLIP ViT-L/14 (openai/CLIP package), exposes `get_visual_features` (pre-projection patch tokens) and `get_text_features`.
+- `models/visual_encoder.py`, `models/y_encoder.py` — v2 (V-JEPA 2 / EmbeddingGemma) encoders. No longer imported by `train.py`/`evaluate.py`; kept for the ablation baseline history in this file, not for reuse.
+- `data/mit_states.py` — MITStates dataset. Now takes a required `transform` arg (pass `CLIPEncoder.preprocess`); returns `(C, H, W)` images, no frame axis.
+- `data/primitive_sampler.py` — PrimitiveBatchSampler + RoutingDataLoader (backbone-agnostic, unchanged by the CLIP swap beyond a `clips`→`images` naming cleanup).
+- `models/primitive_heads.py` — Three heads, updated to 768-dim / `(B, P, D)` inputs for CLIP.
+- `models/loss.py` — InfoNCELoss. Dimension-agnostic, untouched by the swap.
+- `train.py` — Training loop with per-head routing, rewired to `CLIPEncoder`.
+- `evaluate.py` — Three-branch scoring + γ-calibration, rewired to `CLIPEncoder`.
+- `tests/test_clip_smoke.py` — **New.** 10-sample end-to-end shape/loss smoke test for the CLIP pipeline.
 - `CONTEXT.md` — This file. Updated September 2026.
 - `CLAUDE.md` — Static repo structure. Do not use for current project state.
 
-**Branch convention:** One change per branch (v2r2r1, v2r2r2, ...). CLIP work: `clip-backbone` branch off main.
+**Branch convention:** One change per branch (v2r2r1, v2r2r2, ...). CLIP work: implemented on `v3-CLIP`.
 
 ---
 
@@ -181,5 +203,5 @@ Note: v2r2r2 (FiLM object-conditioning on attr head) was run but results not yet
 
 **Prof. Faisal Qureshi** — PI, Ontario Tech University Visual Computing Lab. Published PromptCCZSL (IJCAI 2024 + Dec 2025 update) and the first comprehensive CZSL survey (arXiv:2510.11106, Oct 2025). The survey's four-level taxonomy (no disentanglement → textual → visual → cross-modal) is the framework Faisal uses to situate this work. Current architecture targets cross-modal disentanglement tier.
 
-
+ 
 **PromptCCZSL** (arXiv:2512.09172) — Faisal's lab paper. Frozen CLIP backbone, soft-prompt bank, session-aware multi-modal fusion, multi-teacher distillation, cosine anchor loss, orthogonal projection loss, intra-session diversity loss. Three-branch inference scoring (Eq. 4) directly inspired this project's eval protocol.

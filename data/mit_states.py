@@ -8,10 +8,11 @@ the compositional-split-natural variant used by most CZSL papers.
 Each sample exposes five values so a CZSL evaluator can score all
 (attr, obj, pair) axes independently:
 
-    image  : (num_frames, C, H, W) — same frame repeated across the time axis
-              because VL-JEPA expects a temporal clip but MIT-States images are
-              static.  Repeating instead of padding keeps the distribution of
-              visual tokens identical to what the encoder saw during training.
+    image  : (C, H, W) — preprocessed with the caller-supplied `transform`
+              (CLIP's own preprocessing pipeline; see models/clip_encoder.py).
+              No frame axis: that was a V-JEPA 2 video-format holdover and
+              MIT-States images are static, so CLIP's image encoder consumes
+              them directly.
     text   : str, e.g. "ancient building"
     attr_idx : int index into self.attrs
     obj_idx  : int index into self.objs
@@ -22,32 +23,16 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Literal
+from typing import Callable, Literal
 
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
-from torchvision import transforms
 
 # ── canonical dataset paths on Narval scratch ────────────────────────────────
 _IMAGES_ROOT = Path("/scratch/tarunm10/datasets/release_dataset/images/")
 _SPLITS_ROOT = Path("/scratch/tarunm10/datasets/mit-states/compositional-split-natural/")
 
-# ── ImageNet statistics (ViT models normalise with these) ────────────────────
-_IMAGENET_MEAN = (0.485, 0.456, 0.406)
-_IMAGENET_STD = (0.229, 0.224, 0.225)
-
 Phase = Literal["train", "val", "test"]
-
-
-def _build_transform() -> transforms.Compose:
-    """Standard ViT preprocessing: 256 resize → 224 centre crop → normalise."""
-    return transforms.Compose([
-        # Resize shorter side to 256 before cropping to avoid black borders.
-        transforms.Resize(256),
-        transforms.CenterCrop(224),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=_IMAGENET_MEAN, std=_IMAGENET_STD),
-    ])
 
 
 def _load_pairs(split_file: Path) -> list[tuple[str, str]]:
@@ -70,25 +55,26 @@ class MITStates(Dataset):
 
     Args:
         phase      : "train", "val", or "test"
-        num_frames : number of times to repeat the single image along the time
-                     axis.  Default 2 matches the minimum clip length expected
-                     by VL-JEPA's X-Encoder.
+        transform  : image preprocessing callable, applied to a PIL RGB image
+                     and returning a (C, H, W) tensor.  Pass the CLIP model's
+                     own `preprocess` (returned by `clip.load(...)`, also
+                     exposed as `CLIPEncoder.preprocess`) so image statistics
+                     match what the frozen visual tower was trained on.
         images_root: override the default Narval path (useful for local tests)
         splits_root: override the default Narval path (useful for local tests)
     """
 
     def __init__(
         self,
+        transform: Callable,
         phase: Phase = "train",
-        num_frames: int = 2,
         images_root: Path | str = _IMAGES_ROOT,
         splits_root: Path | str = _SPLITS_ROOT,
     ) -> None:
         self.phase = phase
-        self.num_frames = num_frames
         self.images_root = Path(images_root)
         self.splits_root = Path(splits_root)
-        self.transform = _build_transform()
+        self.transform = transform
 
         # ── load pairs for this split ─────────────────────────────────────
         split_file = self.splits_root / f"{phase}_pairs.txt"
@@ -147,20 +133,14 @@ class MITStates(Dataset):
 
         # Load and preprocess image.
         img = Image.open(img_path).convert("RGB")
-        frame = self.transform(img)  # (C, H, W)
-
-        # Repeat across the frame axis so the tensor matches the VL-JEPA clip
-        # format (num_frames, C, H, W).  unsqueeze(0).expand() avoids a copy
-        # (the frames share storage), while .contiguous() ensures the DataLoader
-        # can batch without strides issues.
-        clip = frame.unsqueeze(0).expand(self.num_frames, -1, -1, -1).contiguous()
+        image = self.transform(img)  # (C, H, W)
 
         text = f"{attr} {obj}"
         attr_idx = self._attr2idx[attr]
         obj_idx = self._obj2idx[obj]
         pair_idx = self._pair2idx[(attr, obj)]
 
-        return clip, text, attr_idx, obj_idx, pair_idx
+        return image, text, attr_idx, obj_idx, pair_idx
 
     # ── Convenience properties ────────────────────────────────────────────────
 
@@ -180,28 +160,31 @@ class MITStates(Dataset):
 # ── Smoke test ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    import torch
+    from models.clip_encoder import CLIPEncoder
+
+    print("Loading CLIPEncoder (for its preprocess transform) …")
+    encoder = CLIPEncoder.load_pretrained()
 
     print("Loading MITStates train split …")
-    ds = MITStates(phase="train")
+    ds = MITStates(transform=encoder.preprocess, phase="train")
     print(f"  samples : {len(ds)}")
     print(f"  attrs   : {ds.num_attrs}")
     print(f"  objects : {ds.num_objs}")
     print(f"  pairs   : {ds.num_pairs}")
 
     loader = DataLoader(ds, batch_size=4, shuffle=False, num_workers=0)
-    clips, texts, attr_idxs, obj_idxs, pair_idxs = next(iter(loader))
+    images, texts, attr_idxs, obj_idxs, pair_idxs = next(iter(loader))
 
     print(f"\nFirst batch:")
-    print(f"  clips     : {tuple(clips.shape)}   dtype={clips.dtype}")
+    print(f"  images    : {tuple(images.shape)}   dtype={images.dtype}")
     print(f"  texts     : {list(texts)}")
     print(f"  attr_idxs : {attr_idxs.tolist()}")
     print(f"  obj_idxs  : {obj_idxs.tolist()}")
     print(f"  pair_idxs : {pair_idxs.tolist()}")
 
-    # Shape contract: (B, num_frames, C, H, W) with C=3, H=W=224.
-    B, F, C, H, W = clips.shape
-    assert F == 2 and C == 3 and H == 224 and W == 224, (
-        f"Unexpected clip shape: {tuple(clips.shape)}"
+    # Shape contract: (B, C, H, W) with C=3, H=W=224 (CLIP ViT-L/14 input size).
+    B, C, H, W = images.shape
+    assert C == 3 and H == 224 and W == 224, (
+        f"Unexpected image shape: {tuple(images.shape)}"
     )
     print("\nShape check passed.")

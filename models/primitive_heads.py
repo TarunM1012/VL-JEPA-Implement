@@ -6,9 +6,9 @@ Design summary
 This module replaces the single LLaMA-3.2-1B predictor with three small,
 from-scratch heads that each specialise in one CZSL primitive:
 
-    AttributeHead  : visual patch tokens ─► (B, 1536)  ≈ Y("red")
-    ObjectHead     : visual patch tokens ─► (B, 1536)  ≈ Y("chair")
-    CompositionHead: attr_embed + obj_embed ─► (B, 1536) ≈ Y("red chair")
+    AttributeHead  : visual patch tokens ─► (B, 768)  ≈ Y("red")
+    ObjectHead     : visual patch tokens ─► (B, 768)  ≈ Y("chair")
+    CompositionHead: attr_embed + obj_embed ─► (B, 768) ≈ Y("red chair")
 
 `AttributeHead` and `ObjectHead` are two independent instances of the SAME
 architecture (`TransformerHead`): a fully-bidirectional transformer encoder
@@ -22,8 +22,9 @@ expressive fusion mechanism.  Its inputs are the OUTPUT embeddings of the
 attribute and object heads (not the raw visual tokens), so it sits
 sequentially on top of them.
 
-All heads emit L2-normalised 1536-dim vectors so that a dot product equals
-cosine similarity, matching `InfoNCELoss` and the Y-encoder output geometry.
+All heads emit L2-normalised 768-dim vectors so that a dot product equals
+cosine similarity, matching `InfoNCELoss` and CLIP's text-projection geometry
+(ViT-L/14's projected embed dim).
 
 Loss routing
 ------------
@@ -52,8 +53,8 @@ import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
 
-_VISUAL_DIM = 1024   # X-encoder patch-token dimension (ViT-L / V-JEPA 2)
-_SHARED_DIM = 1536   # shared visual–language embedding space (matches Y-encoder)
+_VISUAL_DIM = 1024   # CLIP ViT-L/14 visual transformer width (pre-projection patch tokens)
+_SHARED_DIM = 768    # CLIP ViT-L/14 projected text embedding dim (image/text share this space)
 
 Pool = Literal["mean", "token"]
 
@@ -68,30 +69,29 @@ class TransformerHead(nn.Module):
 
     Pipeline
     --------
-        visual_embeds (B, F, P, 1024)
-            └─ flatten frames×patches ─► (B, F*P, 1024)
-            └─ input_proj             ─► (B, F*P, hidden_dim)
+        visual_embeds (B, P, 1024)
+            └─ input_proj             ─► (B, P, hidden_dim)
             └─ [optional CLS token prepended]
             └─ TransformerEncoder     ─► (B, S, hidden_dim)   (no causal mask)
             └─ pool (mean | CLS token)─► (B, hidden_dim)
-            └─ output_proj            ─► (B, 1536)
-            └─ L2-normalise           ─► (B, 1536)
+            └─ output_proj            ─► (B, 768)
+            └─ L2-normalise           ─► (B, 768)
 
     The encoder is bidirectional by construction: `nn.TransformerEncoder`
     applies no causal mask unless one is passed, and we never pass one.  All
-    patch tokens (across all frames) attend to one another freely.
+    patch tokens attend to one another freely.
 
     Parameter budget (defaults: hidden=512, layers=4, heads=8, ffn_mult=4):
         ~13.9 M trainable params — inside the 8–15 M target.
 
     Args
     ----
-        visual_dim : input patch-token dim (1024 for ViT-L).
+        visual_dim : input patch-token dim (1024 for CLIP ViT-L/14, pre-projection).
         hidden_dim : transformer width (paper-task range 384–512).
         num_layers : number of encoder layers (4–6).
         num_heads  : attention heads per layer (6–8); must divide hidden_dim.
         ffn_mult   : feed-forward expansion factor (~4×).
-        output_dim : shared embedding dim (1536, matches Y-encoder).
+        output_dim : shared embedding dim (768, matches CLIP text projection).
         pool       : "mean" (masked-free mean over tokens) or "token"
                      (a learnable aggregation/CLS token).
         dropout    : encoder dropout.  Defaults to 0.0 so that the
@@ -151,9 +151,9 @@ class TransformerHead(nn.Module):
             encoder_layer, num_layers=num_layers, enable_nested_tensor=False,
         )
 
-        # Final projection into the shared 1536-dim space.  No bias keeps the
+        # Final projection into the shared 768-dim space.  No bias keeps the
         # origin meaningful after L2 normalisation (same rationale as the
-        # Y-encoder projection head).
+        # CLIP text-projection geometry it targets).
         self.output_proj = nn.Linear(hidden_dim, output_dim, bias=False)
 
         n_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
@@ -167,22 +167,17 @@ class TransformerHead(nn.Module):
     def forward(self, visual_embeds: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            visual_embeds : (B, F, num_patches, visual_dim) patch tokens from
+            visual_embeds : (B, num_patches, visual_dim) patch tokens from
                             the X-encoder.
 
         Returns:
             (B, output_dim) L2-normalised embeddings.
         """
-        B, num_frames, P, D = visual_embeds.shape
-
-        # Flatten frames × patches into one token axis so every patch from
-        # every frame participates in attention together.
-        x = visual_embeds.reshape(B, num_frames * P, D)   # (B, F*P, visual_dim)
-        x = self.input_proj(x)                            # (B, F*P, hidden_dim)
+        x = self.input_proj(visual_embeds)                # (B, P, hidden_dim)
 
         if self.cls_token is not None:
-            cls = self.cls_token.expand(B, -1, -1)        # (B, 1, hidden_dim)
-            x = torch.cat([cls, x], dim=1)                # (B, 1+F*P, hidden_dim)
+            cls = self.cls_token.expand(x.shape[0], -1, -1)  # (B, 1, hidden_dim)
+            x = torch.cat([cls, x], dim=1)                # (B, 1+P, hidden_dim)
 
         # No mask passed → fully bidirectional self-attention.  Visual tokens
         # are never padded, so there is nothing to mask.
@@ -211,7 +206,7 @@ class CompositionHead(nn.Module):
 
     Args
     ----
-        embed_dim : dimension of the attr/obj/output embeddings (1536).
+        embed_dim : dimension of the attr/obj/output embeddings (768).
         hidden_dim: width of the MLP hidden layers.
         num_layers: number of linear layers (2 or 3).
         fusion    : "concat" → input is [attr ; obj]  (2*embed_dim)
@@ -309,10 +304,10 @@ class PrimitiveHeads(nn.Module):
     training/eval/checkpointing treat them as a unit.
 
     Forward entry points (one per batch type):
-        forward_attribute(visual)    → (B, 1536)   train on attr-batches
-        forward_object(visual)       → (B, 1536)   train on obj-batches
-        forward_composition(visual)  → (B, 1536)   train on comp-batches
-        compose(attr_embed, obj_embed) → (B, 1536) reuse precomputed embeds
+        forward_attribute(visual)    → (B, 768)   train on attr-batches
+        forward_object(visual)       → (B, 768)   train on obj-batches
+        forward_composition(visual)  → (B, 768)   train on comp-batches
+        compose(attr_embed, obj_embed) → (B, 768) reuse precomputed embeds
     """
 
     def __init__(
@@ -386,8 +381,9 @@ class PrimitiveHeads(nn.Module):
         LayerNorm weight/bias and all Linear biases are excluded from weight
         decay (see `_split_decay_params`); everything else decays normally
         via the optimiser's global weight_decay. All heads are trained from
-        scratch (unlike the Y-encoder projection, which sits on a frozen
-        backbone and uses a reduced LR), so no LR multiplier is applied.
+        scratch on top of a fully frozen CLIP backbone (no trainable
+        projection anywhere else in the model), so no LR multiplier is
+        applied.
         """
         decay, no_decay = [], []
         for head in (self.attr_head, self.obj_head, self.comp_head):
@@ -425,13 +421,13 @@ class PrimitiveHeads(nn.Module):
         composition head, never the attr/obj heads.  This enforces the
         "each head trains on its own batch type" invariant.
 
-        visual_vec is mean-pooled over frames and patches from the frozen encoder
-        output; it carries no grad so it does not break the gradient isolation.
+        visual_vec is mean-pooled over patches from the frozen encoder output;
+        it carries no grad so it does not break the gradient isolation.
         """
         with torch.no_grad():
             attr_embed = self.attr_head(visual_embeds)
             obj_embed = self.obj_head(visual_embeds)
-        visual_vec = F.normalize(visual_embeds.mean(dim=(1, 2)), dim=-1)  # (B, 1024)
+        visual_vec = F.normalize(visual_embeds.mean(dim=1), dim=-1)  # (B, 1024)
         return self.comp_head(attr_embed, obj_embed, visual_vec)
 
 
@@ -455,9 +451,9 @@ if __name__ == "__main__":
 
     torch.manual_seed(0)
 
-    # (batch=2, frames=2, patches=196, visual_dim=1024)
-    B, num_frames, P, D = 2, 2, 196, _VISUAL_DIM
-    visual = torch.randn(B, num_frames, P, D)
+    # (batch=2, patches=256, visual_dim=1024) — CLIP ViT-L/14 @ 224px has 256 patches
+    B, P, D = 2, 256, _VISUAL_DIM
+    visual = torch.randn(B, P, D)
 
     heads = PrimitiveHeads.build()
 

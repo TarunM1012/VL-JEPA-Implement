@@ -153,13 +153,13 @@ class PrimitiveBatchSampler(torch.utils.data.Sampler[List[int]]):
 
 def _make_collate(mode: Mode):
     """
-    Build a collate_fn that stacks clips and emits the text appropriate to
+    Build a collate_fn that stacks images and emits the text appropriate to
     `mode`.  Each raw sample is the 5-tuple from MITStates.__getitem__:
-    (clip, text, attr_idx, obj_idx, pair_idx).
+    (image, text, attr_idx, obj_idx, pair_idx).
     """
 
     def collate(samples: List[tuple]):
-        clips = torch.stack([s[0] for s in samples], dim=0)   # (B, F, C, H, W)
+        images = torch.stack([s[0] for s in samples], dim=0)   # (B, C, H, W)
         texts: List[str] = []
         for s in samples:
             full = s[1]
@@ -170,7 +170,7 @@ def _make_collate(mode: Mode):
                 texts.append(obj)
             else:  # "comp"
                 texts.append(full)
-        return clips, texts
+        return images, texts
 
     return collate
 
@@ -183,8 +183,8 @@ class RoutingDataLoader:
     """
     Interleaves three per-mode DataLoaders round-robin.
 
-    Iterating yields `(clips, texts, batch_type)` where `batch_type` is one of
-    "attr" | "obj" | "comp", `clips` is (B, F, C, H, W), and `texts` is the
+    Iterating yields `(images, texts, batch_type)` where `batch_type` is one
+    of "attr" | "obj" | "comp", `images` is (B, C, H, W), and `texts` is the
     list of mode-appropriate target strings (already reduced to attribute-only,
     object-only, or the full phrase).
 
@@ -235,8 +235,8 @@ class RoutingDataLoader:
         iters = {mode: iter(loader) for mode, loader in self._loaders.items()}
         for _ in range(self.num_batches_per_mode):
             for mode in _MODES:
-                clips, texts = next(iters[mode])
-                yield clips, texts, mode
+                images, texts = next(iters[mode])
+                yield images, texts, mode
 
 
 # ----------------------------------------------------------------------
@@ -276,8 +276,8 @@ if __name__ == "__main__":
 
         def __getitem__(self, idx):
             _path, attr, obj = self.samples[idx]
-            clip = torch.zeros(2, 3, 8, 8)   # tiny fake clip
-            return clip, f"{attr} {obj}", 0, 0, 0
+            image = torch.zeros(3, 8, 8)   # tiny fake image
+            return image, f"{attr} {obj}", 0, 0, 0
 
     ds = _FakeMITStates()
     bs = 4
@@ -301,10 +301,10 @@ if __name__ == "__main__":
                                num_workers=0, pin_memory=False)
     seen = {m: 0 for m in _MODES}
     order = []
-    for clips, texts, batch_type in loader:
+    for images, texts, batch_type in loader:
         seen[batch_type] += 1
         order.append(batch_type)
-        assert clips.shape[0] == bs
+        assert images.shape[0] == bs
         assert len(texts) == bs
     assert seen == {"attr": 5, "obj": 5, "comp": 5}, seen
     assert order[:3] == ["attr", "obj", "comp"], order[:3]
@@ -313,7 +313,7 @@ if __name__ == "__main__":
     # ---- Check 3: mode-appropriate texts ---------------------------------
     loader = RoutingDataLoader(ds, batch_size=bs, num_batches_per_mode=1,
                                num_workers=0, pin_memory=False)
-    for clips, texts, batch_type in loader:
+    for images, texts, batch_type in loader:
         if batch_type == "attr":
             assert all(" " not in t for t in texts), texts
         elif batch_type == "comp":

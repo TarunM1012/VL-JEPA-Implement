@@ -3,13 +3,13 @@ CZSL evaluation for VL-JEPA on MIT-States.
 
 Protocol
 --------
-1. Pre-compute y_encoder embeddings for every (attr, obj) pair in the
+1. Pre-compute CLIP text embeddings for every (attr, obj) pair in the
    closed-world candidate set, in three banks: attribute-only Y("attr"),
    object-only Y("obj"), and full-composition Y("attr obj").
-2. For each test image, run visual_encoder once, then the three primitive
-   heads to produce attribute, object, and composition predictions in the
-   shared embedding space.  The composition prediction fuses the attr/obj
-   head outputs through the composition head.
+2. For each test image, run CLIPEncoder's visual tower once, then the three
+   primitive heads to produce attribute, object, and composition predictions
+   in the shared embedding space.  The composition prediction fuses the
+   attr/obj head outputs through the composition head.
 3. Three-branch scoring: each prediction is scored against its matching bank,
    then combined with λ weights into a per-pair score.
 4. Report seen accuracy, unseen accuracy, and harmonic mean (HM).
@@ -35,9 +35,8 @@ from torch.utils.data import DataLoader
 sys.path.insert(0, str(Path(__file__).parent))
 
 from data.mit_states import MITStates as MITStatesDataset, _load_pairs
+from models.clip_encoder import CLIPEncoder
 from models.primitive_heads import PrimitiveHeads
-from models.visual_encoder import VisualEncoder
-from models.y_encoder import YEncoder
 
 logging.basicConfig(
     level=logging.INFO,
@@ -56,8 +55,6 @@ def parse_args() -> argparse.Namespace:
         help="path to the checkpoint file (default: checkpoints/latest.pt)",
     )
     parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--num_frames", type=int, default=2,
-                        help="clip length passed to VisualEncoder (must match training)")
     parser.add_argument(
         "--data_root",
         default="/scratch/tarunm10/datasets/release_dataset/images",
@@ -101,42 +98,35 @@ def parse_args() -> argparse.Namespace:
 
 def load_models(
     ckpt_path: Path, device: torch.device
-) -> tuple[VisualEncoder, YEncoder, PrimitiveHeads]:
+) -> tuple[CLIPEncoder, PrimitiveHeads]:
     logger.info("Loading checkpoint: %s", ckpt_path)
     state = torch.load(ckpt_path, map_location="cpu", weights_only=False)
 
-    logger.info("Building VisualEncoder …")
-    visual_encoder = VisualEncoder.load_pretrained(is_frozen=True)
-    visual_encoder.load_state_dict(state["visual_encoder"])
-    visual_encoder.to(device).eval()
-
-    logger.info("Building YEncoder …")
-    y_encoder = YEncoder.load_pretrained(device=device).to(device)
-    y_encoder.load_state_dict(state["y_encoder"])
-    y_encoder.eval()
+    logger.info("Loading CLIPEncoder …")
+    clip_encoder = CLIPEncoder.load_pretrained(device=device)
+    clip_encoder.eval()
 
     logger.info("Building PrimitiveHeads …")
     head_config = state.get("head_config") or {}
-    head_config.setdefault("use_visual_in_comp", False)
     primitive_heads = PrimitiveHeads.build(device=device, **head_config)
     primitive_heads.load_state_dict(state["primitive_heads"])
     primitive_heads.eval()
 
-    return visual_encoder, y_encoder, primitive_heads
+    return clip_encoder, primitive_heads
 
 
 # ── Pair embedding cache ──────────────────────────────────────────────────────
 
 @torch.no_grad()
 def encode_all_pairs(
-    y_encoder: YEncoder,
+    clip_encoder: CLIPEncoder,
     pairs: list[tuple[str, str]],
     batch_size: int,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return three embedding banks: attribute, object, and composition.
 
-    Each is (num_pairs, 1536) L2-normalised, matching the targets each head was
+    Each is (num_pairs, 768) L2-normalised, matching the targets each head was
     trained against:
         attr bank : Y("attr")        — attribute word alone
         obj  bank : Y("obj")         — object word alone
@@ -147,9 +137,9 @@ def encode_all_pairs(
     phrases = [f"{attr} {obj}" for attr, obj in pairs]
     attr_chunks, obj_chunks, comp_chunks = [], [], []
     for i in range(0, len(attrs), batch_size):
-        ae = y_encoder(attrs[i   : i + batch_size])
-        oe = y_encoder(objs[i    : i + batch_size])
-        ce = y_encoder(phrases[i : i + batch_size])
+        ae = F.normalize(clip_encoder.get_text_features(attrs[i   : i + batch_size]), dim=-1)
+        oe = F.normalize(clip_encoder.get_text_features(objs[i    : i + batch_size]), dim=-1)
+        ce = F.normalize(clip_encoder.get_text_features(phrases[i : i + batch_size]), dim=-1)
         attr_chunks.append(ae.cpu())
         obj_chunks.append(oe.cpu())
         comp_chunks.append(ce.cpu())
@@ -167,10 +157,17 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info("Device: %s", device)
 
+    # ── Models ────────────────────────────────────────────────────────────────
+    clip_encoder, primitive_heads = load_models(
+        Path(args.checkpoint), device
+    )
+
     # ── Datasets ──────────────────────────────────────────────────────────────
+    # Images are preprocessed with CLIP's own transform so pixel statistics
+    # match what the frozen visual tower expects.
     test_dataset = MITStatesDataset(
+        transform=clip_encoder.preprocess,
         phase=args.phase,
-        num_frames=args.num_frames,
         images_root=args.data_root,
         splits_root=args.split_root,
     )
@@ -208,17 +205,12 @@ def main() -> None:
 
     logger.info("%s samples: %d", args.phase.capitalize(), len(test_dataset))
 
-    # ── Models ────────────────────────────────────────────────────────────────
-    visual_encoder, y_encoder, primitive_heads = load_models(
-        Path(args.checkpoint), device
-    )
-
     # ── Pre-compute three embedding banks over the candidate set ──────────────
-    logger.info("Encoding %d pair texts via y_encoder …", len(candidate_pairs))
+    logger.info("Encoding %d pair texts via CLIP text encoder …", len(candidate_pairs))
     attr_embeds_bank, obj_embeds_bank, comp_embeds_bank = encode_all_pairs(
-        y_encoder, candidate_pairs, args.batch_size, device
+        clip_encoder, candidate_pairs, args.batch_size, device
     )
-    attr_embeds_bank = attr_embeds_bank.to(device)   # (num_candidates, 1536)
+    attr_embeds_bank = attr_embeds_bank.to(device)   # (num_candidates, 768)
     obj_embeds_bank  = obj_embeds_bank.to(device)
     comp_embeds_bank = comp_embeds_bank.to(device)
 
@@ -248,20 +240,20 @@ def main() -> None:
     )
 
     with torch.no_grad():
-        for batch_idx, (clips, _texts, _attr_idxs, _obj_idxs, pair_idxs) in enumerate(
+        for batch_idx, (images, _texts, _attr_idxs, _obj_idxs, pair_idxs) in enumerate(
             test_loader
         ):
-            clips     = clips.to(device, non_blocking=True)   # (B, F, C, H, W)
+            images    = images.to(device, non_blocking=True)  # (B, C, H, W)
             pair_idxs = pair_idxs.to(device)                  # (B,) vocab-space
 
             # Step 1 — Visual encoding (shared by all three heads).
-            patch_tokens = visual_encoder(clips)               # (B, F, P, 1024)
+            patch_tokens = clip_encoder.get_visual_features(images)  # (B, P, 1024)
 
             # Step 2 — Per-primitive predictions in the shared embedding space.
-            attr_pred  = primitive_heads.forward_attribute(patch_tokens)  # (B, 1536)
-            obj_pred   = primitive_heads.forward_object(patch_tokens)     # (B, 1536)
-            visual_vec = F.normalize(patch_tokens.mean(dim=(1, 2)), dim=-1)  # (B, 1024)
-            comp_pred  = primitive_heads.compose(attr_pred, obj_pred, visual_vec)  # (B, 1536)
+            attr_pred  = primitive_heads.forward_attribute(patch_tokens)  # (B, 768)
+            obj_pred   = primitive_heads.forward_object(patch_tokens)     # (B, 768)
+            visual_vec = F.normalize(patch_tokens.mean(dim=1), dim=-1)    # (B, 1024)
+            comp_pred  = primitive_heads.compose(attr_pred, obj_pred, visual_vec)  # (B, 768)
 
             # Step 3 — Three-branch λ-weighted base scores against candidate set.
             sims = (

@@ -295,6 +295,72 @@ def _split_decay_params(module: nn.Module) -> tuple[List[nn.Parameter], List[nn.
 
 
 # ----------------------------------------------------------------------
+# Vanilla-baseline head stand-ins (train_vanilla.py, variant="vanilla")
+# ----------------------------------------------------------------------
+
+class FrozenProjectionHead(nn.Module):
+    """
+    Zero-trainable-parameter substitute for `TransformerHead`, used only by
+    the vanilla CLIP+CSP ablation baseline (`train_vanilla.py`, `variant=
+    "vanilla"` in `PrimitiveHeads.build()`).
+
+    That baseline has no learned primitive heads at all -- only a text-side
+    soft prompt is trained. Its "attribute"/"object" prediction is just
+    CLIP's own image embedding, reconstructed here by mean-pooling patch
+    tokens and applying CLIP's own frozen `ln_post` + visual projection (the
+    exact map CLIP applies to its CLS token).
+
+    `ln_post`/`proj` values are copied from a live `CLIPEncoder` once via
+    `load_clip_projection()` (see `PrimitiveHeads.load_frozen_projection`),
+    then persist as ordinary state_dict entries -- a frozen `nn.LayerNorm`
+    plus a buffer -- so a checkpoint round-trips through the unmodified
+    `PrimitiveHeads.build()` / `load_state_dict()` call in evaluate.py with
+    no extra bookkeeping.
+    """
+
+    def __init__(
+        self, visual_dim: int = _VISUAL_DIM, output_dim: int = _SHARED_DIM
+    ) -> None:
+        super().__init__()
+        self.ln_post = nn.LayerNorm(visual_dim)
+        for p in self.ln_post.parameters():
+            p.requires_grad = False
+        self.register_buffer("proj", torch.zeros(visual_dim, output_dim))
+
+    def load_clip_projection(self, clip_encoder) -> None:
+        """Copy CLIP's own frozen ln_post + visual.proj from a live CLIPEncoder."""
+        visual = clip_encoder.clip_model.visual
+        with torch.no_grad():
+            self.ln_post.weight.copy_(visual.ln_post.weight.float())
+            self.ln_post.bias.copy_(visual.ln_post.bias.float())
+            self.proj.copy_(visual.proj.float())
+
+    def forward(self, visual_embeds: torch.Tensor) -> torch.Tensor:
+        pooled = visual_embeds.mean(dim=1)     # (B, visual_dim)
+        pooled = self.ln_post(pooled)
+        pooled = pooled @ self.proj            # (B, output_dim)
+        return F.normalize(pooled, dim=-1)
+
+
+class PassThroughCompHead(nn.Module):
+    """
+    Zero-parameter composition-head stand-in for the vanilla variant.
+
+    `attr_embed` and `obj_embed` are already identical (both are CLIP's own
+    image embedding, via `FrozenProjectionHead`), so "composing" them is the
+    identity -- there is nothing to fuse.
+    """
+
+    def forward(
+        self,
+        attr_embed: torch.Tensor,
+        obj_embed: torch.Tensor,
+        visual_vec: torch.Tensor,
+    ) -> torch.Tensor:
+        return attr_embed
+
+
+# ----------------------------------------------------------------------
 # Container
 # ----------------------------------------------------------------------
 
@@ -312,9 +378,9 @@ class PrimitiveHeads(nn.Module):
 
     def __init__(
         self,
-        attr_head: TransformerHead,
-        obj_head: TransformerHead,
-        comp_head: CompositionHead,
+        attr_head: nn.Module,
+        obj_head: nn.Module,
+        comp_head: nn.Module,
     ) -> None:
         super().__init__()
         self.attr_head = attr_head
@@ -339,9 +405,31 @@ class PrimitiveHeads(nn.Module):
         comp_layers: int = 3,
         comp_hidden: int = _SHARED_DIM,
         comp_visual_dim: int = _VISUAL_DIM,
+        variant: Literal["default", "vanilla"] = "default",
         device: Optional[torch.device] = None,
     ) -> "PrimitiveHeads":
-        """Construct all three heads with shared transformer hyperparameters."""
+        """
+        Construct all three heads with shared transformer hyperparameters.
+
+        `variant="vanilla"` builds the vanilla CLIP+CSP ablation baseline
+        (train_vanilla.py) instead: zero-trainable-parameter head stand-ins
+        (`FrozenProjectionHead` / `PassThroughCompHead`) rather than learned
+        transformer/MLP heads, ignoring every hyperparameter above. This
+        keeps evaluate.py's `PrimitiveHeads.build(device=device,
+        **head_config)` call working unmodified for both variants, since
+        `head_config` is just whatever this method recorded at train time.
+        """
+        if variant == "vanilla":
+            attr_head = FrozenProjectionHead(visual_dim=comp_visual_dim, output_dim=comp_hidden)
+            obj_head = FrozenProjectionHead(visual_dim=comp_visual_dim, output_dim=comp_hidden)
+            comp_head = PassThroughCompHead()
+            instance = cls(attr_head, obj_head, comp_head)
+            instance.config = dict(variant="vanilla")
+            logger.info("PrimitiveHeads: variant=vanilla, 0 trainable params (frozen CLIP projection only)")
+            if device is not None:
+                instance = instance.to(device)
+            return instance
+
         attr_head = TransformerHead(
             hidden_dim=hidden_dim, num_layers=num_layers, num_heads=num_heads,
             ffn_mult=ffn_mult, pool=pool, dropout=head_dropout,
@@ -363,7 +451,7 @@ class PrimitiveHeads(nn.Module):
             hidden_dim=hidden_dim, num_layers=num_layers, num_heads=num_heads,
             ffn_mult=ffn_mult, pool=pool, head_dropout=head_dropout,
             comp_fusion=comp_fusion, comp_layers=comp_layers, comp_hidden=comp_hidden,
-            comp_visual_dim=comp_visual_dim,
+            comp_visual_dim=comp_visual_dim, variant="default",
         )
 
         total = sum(p.numel() for p in instance.parameters() if p.requires_grad)
@@ -372,6 +460,23 @@ class PrimitiveHeads(nn.Module):
         if device is not None:
             instance = instance.to(device)
         return instance
+
+    # ---- Vanilla-variant setup ----------------------------------------------
+
+    def load_frozen_projection(self, clip_encoder) -> None:
+        """
+        Populate the vanilla variant's frozen CLIP ln_post/proj buffers from
+        a live CLIPEncoder. Call once after `build(variant="vanilla")`, at
+        train time only — the resulting buffers are then saved/restored via
+        the ordinary state_dict, so evaluate.py never needs to call this.
+        """
+        if not isinstance(self.attr_head, FrozenProjectionHead):
+            raise RuntimeError(
+                "load_frozen_projection() only applies to PrimitiveHeads "
+                "built with variant='vanilla'"
+            )
+        self.attr_head.load_clip_projection(clip_encoder)
+        self.obj_head.load_clip_projection(clip_encoder)
 
     # ---- Optimiser integration --------------------------------------------
 

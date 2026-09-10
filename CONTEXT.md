@@ -36,6 +36,34 @@ Not yet done: a real training run (explicitly out of scope for this pass — sub
 
 ---
 
+## Current Architecture (CLIP backbone + CSP-style soft prompts, v3-CLIP-r2-soft-prompts branch)
+
+**Decision:** Add CSP-style learnable soft prompts to the CLIP text-encoder targets, on top of v3-CLIP r1 (previous section). Everything else — visual encoder, three primitive heads, InfoNCE loss, batch sampler, three-branch eval scoring — is unchanged.
+
+**What changed:** `models/soft_prompt_encoder.py` (new) wraps the frozen CLIP text tower with three independent sets of learnable context vectors, one per primitive head:
+
+```
+attr target ─► [SOT] [attr_ctx_1 .. attr_ctx_M] [attr words]     [EOT]
+obj  target ─► [SOT] [obj_ctx_1  .. obj_ctx_M ] [obj words]      [EOT]
+comp target ─► [SOT] [comp_ctx_1 .. comp_ctx_M] [attr obj words] [EOT]
+```
+
+In v3-CLIP r1, text targets were raw class words/phrases fed directly to CLIP's frozen `encode_text` (no template at all). Now each head's target is encoded through that head's own learnable prompt context (M=`--prompt_n_ctx`, default 8) instead. Only the context vectors are trainable — CLIP's token embedding table, positional embedding, transformer, `ln_final`, and `text_projection` are all still frozen and untouched.
+
+**Implementation (CoOp/CSP-style token splicing):** Since context vectors are continuous, not discrete tokens, they can't be inserted via string concatenation + `clip.tokenize`. Instead: tokenize a placeholder prompt (`"X X ... X <words>"`, where `"X"` is confirmed to be exactly one CLIP BPE token), look up its token embeddings, then splice the learned context vectors in at the placeholder's position before running the transformer. Sequence length and the EOT token's position are unchanged by the splice, so `tokens.argmax(dim=-1)` — CLIP's own trick for finding EOT (the highest token id) — still correctly pools each prompt's final transformer state.
+
+**Gradient isolation:** Each head's context vectors receive gradients only from that head's batches (verified: attr-batch backward touches `attr_ctx` only, `obj_ctx`/`comp_ctx` grads stay `None`; the frozen CLIP backbone receives no gradient at all). This mirrors the existing attr/obj/comp gradient-isolation invariant in `models/primitive_heads.py`.
+
+**Training integration (`train.py`):** `SoftPromptTextEncoder` is constructed alongside `PrimitiveHeads`, its `.parameters()` added to the optimizer as their own no-weight-decay group (same rationale as excluding LayerNorm/bias/temperature τ from decay — these are continuous embeddings, not weight matrices). `forward_batch`'s target computation changed from `clip_encoder.get_text_features(texts)` to `soft_prompts(texts, head=batch_type)`. Checkpoints now save/load the three context-vector tensors and `prompt_n_ctx` (`load_models`/`load_checkpoint` warn and fall back to randomly-initialised context vectors if loading a pre-r2 checkpoint that lacks them).
+
+**Eval integration (`evaluate.py`):** `encode_all_pairs` now builds the attr/obj/comp embedding banks via `soft_prompts(..., head=...)` instead of `clip_encoder.get_text_features(...)`, so the candidate-pair banks used for three-branch scoring go through the same learned prompts the heads were trained against.
+
+**Status (2026-09-10): implemented, smoke-tested locally (ViT-B/32, CPU, synthetic data — real Narval ViT-L/14 checkpoint not reachable from this dev box), not yet trained on MIT-States.**
+
+**Branch:** `v3-CLIP-r2-soft-prompts` (off `v3-CLIP`).
+
+---
+
 ## Previous Architecture (v2, V-JEPA 2 backbone — superseded, kept as ablation baseline)
 
 **Visual Encoder:** Frozen V-JEPA 2 ViT-L (`facebook/vjepa2-vitl-fpc64-256`). Patch tokens shape (B, F, num_patches, 1024). Images duplicated to 2 frames for video format compliance.
@@ -183,19 +211,20 @@ Note: v2r2r2 (FiLM object-conditioning on attr head) was run but results not yet
 
 ## Repo Structure
 
-- `models/clip_encoder.py` — **New.** Frozen CLIP ViT-L/14 (openai/CLIP package), exposes `get_visual_features` (pre-projection patch tokens) and `get_text_features`.
+- `models/clip_encoder.py` — Frozen CLIP ViT-L/14 (openai/CLIP package), exposes `get_visual_features` (pre-projection patch tokens) and `get_text_features` (unprompted; kept for the visual path and for callers that want raw CLIP text embeddings, no longer used for training/eval targets).
+- `models/soft_prompt_encoder.py` — **New (v3-CLIP-r2).** `SoftPromptTextEncoder`: three learnable CSP-style soft-prompt context-vector sets (attr/obj/comp) wrapping the frozen CLIP text tower; produces the text-encoder targets used by training and eval.
 - `models/visual_encoder.py`, `models/y_encoder.py` — v2 (V-JEPA 2 / EmbeddingGemma) encoders. No longer imported by `train.py`/`evaluate.py`; kept for the ablation baseline history in this file, not for reuse.
 - `data/mit_states.py` — MITStates dataset. Now takes a required `transform` arg (pass `CLIPEncoder.preprocess`); returns `(C, H, W)` images, no frame axis.
 - `data/primitive_sampler.py` — PrimitiveBatchSampler + RoutingDataLoader (backbone-agnostic, unchanged by the CLIP swap beyond a `clips`→`images` naming cleanup).
 - `models/primitive_heads.py` — Three heads, updated to 768-dim / `(B, P, D)` inputs for CLIP.
 - `models/loss.py` — InfoNCELoss. Dimension-agnostic, untouched by the swap.
-- `train.py` — Training loop with per-head routing, rewired to `CLIPEncoder`.
-- `evaluate.py` — Three-branch scoring + γ-calibration, rewired to `CLIPEncoder`.
-- `tests/test_clip_smoke.py` — **New.** 10-sample end-to-end shape/loss smoke test for the CLIP pipeline.
+- `train.py` — Training loop with per-head routing, rewired to `CLIPEncoder` + `SoftPromptTextEncoder`.
+- `evaluate.py` — Three-branch scoring + γ-calibration, rewired to `CLIPEncoder` + `SoftPromptTextEncoder`.
+- `tests/test_clip_smoke.py` — 10-sample end-to-end shape/loss smoke test for the CLIP + soft-prompt pipeline (includes per-head gradient-isolation checks).
 - `CONTEXT.md` — This file. Updated September 2026.
 - `CLAUDE.md` — Static repo structure. Do not use for current project state.
 
-**Branch convention:** One change per branch (v2r2r1, v2r2r2, ...). CLIP work: implemented on `v3-CLIP`.
+**Branch convention:** One change per branch (v2r2r1, v2r2r2, ...). CLIP work: implemented on `v3-CLIP`; soft prompts on `v3-CLIP-r2-soft-prompts`.
 
 ---
 

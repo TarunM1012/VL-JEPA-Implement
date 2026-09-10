@@ -37,6 +37,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from data.mit_states import MITStates as MITStatesDataset, _load_pairs
 from models.clip_encoder import CLIPEncoder
 from models.primitive_heads import PrimitiveHeads
+from models.soft_prompt_encoder import SoftPromptTextEncoder
 
 logging.basicConfig(
     level=logging.INFO,
@@ -98,7 +99,7 @@ def parse_args() -> argparse.Namespace:
 
 def load_models(
     ckpt_path: Path, device: torch.device
-) -> tuple[CLIPEncoder, PrimitiveHeads]:
+) -> tuple[CLIPEncoder, PrimitiveHeads, SoftPromptTextEncoder]:
     logger.info("Loading checkpoint: %s", ckpt_path)
     state = torch.load(ckpt_path, map_location="cpu", weights_only=False)
 
@@ -112,14 +113,29 @@ def load_models(
     primitive_heads.load_state_dict(state["primitive_heads"])
     primitive_heads.eval()
 
-    return clip_encoder, primitive_heads
+    logger.info("Building SoftPromptTextEncoder …")
+    n_ctx = state.get("prompt_n_ctx", 8)
+    soft_prompts = SoftPromptTextEncoder(clip_encoder.clip_model, n_ctx=n_ctx).to(device)
+    if "soft_prompts" in state:
+        with torch.no_grad():
+            soft_prompts.attr_ctx.copy_(state["soft_prompts"]["attr_ctx"].to(device))
+            soft_prompts.obj_ctx.copy_(state["soft_prompts"]["obj_ctx"].to(device))
+            soft_prompts.comp_ctx.copy_(state["soft_prompts"]["comp_ctx"].to(device))
+    else:
+        logger.warning(
+            "Checkpoint has no 'soft_prompts' entry — evaluating with randomly "
+            "initialised soft-prompt context vectors (pre-v3-CLIP-r2 checkpoint?)."
+        )
+    soft_prompts.eval()
+
+    return clip_encoder, primitive_heads, soft_prompts
 
 
 # ── Pair embedding cache ──────────────────────────────────────────────────────
 
 @torch.no_grad()
 def encode_all_pairs(
-    clip_encoder: CLIPEncoder,
+    soft_prompts: SoftPromptTextEncoder,
     pairs: list[tuple[str, str]],
     batch_size: int,
     device: torch.device,
@@ -127,19 +143,20 @@ def encode_all_pairs(
     """Return three embedding banks: attribute, object, and composition.
 
     Each is (num_pairs, 768) L2-normalised, matching the targets each head was
-    trained against:
-        attr bank : Y("attr")        — attribute word alone
-        obj  bank : Y("obj")         — object word alone
-        comp bank : Y("attr obj")    — the full composition phrase
+    trained against, encoded through that head's learnable soft-prompt
+    context vectors (v3-CLIP r2 — see models/soft_prompt_encoder.py):
+        attr bank : soft_prompts(attr, head="attr")        — attribute word alone
+        obj  bank : soft_prompts(obj,  head="obj")         — object word alone
+        comp bank : soft_prompts("attr obj", head="comp")  — full composition phrase
     """
     attrs   = [attr            for attr, obj in pairs]
     objs    = [obj             for attr, obj in pairs]
     phrases = [f"{attr} {obj}" for attr, obj in pairs]
     attr_chunks, obj_chunks, comp_chunks = [], [], []
     for i in range(0, len(attrs), batch_size):
-        ae = F.normalize(clip_encoder.get_text_features(attrs[i   : i + batch_size]), dim=-1)
-        oe = F.normalize(clip_encoder.get_text_features(objs[i    : i + batch_size]), dim=-1)
-        ce = F.normalize(clip_encoder.get_text_features(phrases[i : i + batch_size]), dim=-1)
+        ae = F.normalize(soft_prompts(attrs[i   : i + batch_size], head="attr"), dim=-1)
+        oe = F.normalize(soft_prompts(objs[i    : i + batch_size], head="obj"),  dim=-1)
+        ce = F.normalize(soft_prompts(phrases[i : i + batch_size], head="comp"), dim=-1)
         attr_chunks.append(ae.cpu())
         obj_chunks.append(oe.cpu())
         comp_chunks.append(ce.cpu())
@@ -158,7 +175,7 @@ def main() -> None:
     logger.info("Device: %s", device)
 
     # ── Models ────────────────────────────────────────────────────────────────
-    clip_encoder, primitive_heads = load_models(
+    clip_encoder, primitive_heads, soft_prompts = load_models(
         Path(args.checkpoint), device
     )
 
@@ -206,9 +223,9 @@ def main() -> None:
     logger.info("%s samples: %d", args.phase.capitalize(), len(test_dataset))
 
     # ── Pre-compute three embedding banks over the candidate set ──────────────
-    logger.info("Encoding %d pair texts via CLIP text encoder …", len(candidate_pairs))
+    logger.info("Encoding %d pair texts via soft-prompted CLIP text encoder …", len(candidate_pairs))
     attr_embeds_bank, obj_embeds_bank, comp_embeds_bank = encode_all_pairs(
-        clip_encoder, candidate_pairs, args.batch_size, device
+        soft_prompts, candidate_pairs, args.batch_size, device
     )
     attr_embeds_bank = attr_embeds_bank.to(device)   # (num_candidates, 768)
     obj_embeds_bank  = obj_embeds_bank.to(device)

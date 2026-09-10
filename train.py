@@ -14,9 +14,14 @@ Pipeline per batch
 ------------------
 images (B, C, H, W)    ──►  CLIPEncoder.get_visual_features
                         ──►  patch tokens (B, P, 1024)
-texts List[str]        ──►  CLIPEncoder.get_text_features   ──►  target embeds (B, 768)
-patch tokens           ──►  one head                        ──►  pred embeds   (B, 768)
-pred + target          ──►  InfoNCELoss                     ──►  scalar loss (backprop one head)
+texts List[str]        ──►  SoftPromptTextEncoder(head=batch_type)  ──►  target embeds (B, 768)
+patch tokens           ──►  one head                                ──►  pred embeds   (B, 768)
+pred + target          ──►  InfoNCELoss                             ──►  scalar loss (backprop one head)
+
+v3-CLIP r2: text targets are encoded through per-head CSP-style learnable
+soft prompts (see models/soft_prompt_encoder.py) instead of raw words fed
+straight to frozen CLIP. The soft-prompt context vectors are the only new
+trainable parameters; everything else is identical to v3-CLIP r1.
 """
 
 import argparse
@@ -35,6 +40,7 @@ from data.primitive_sampler import RoutingDataLoader
 from models.clip_encoder import CLIPEncoder
 from models.loss import InfoNCELoss
 from models.primitive_heads import PrimitiveHeads
+from models.soft_prompt_encoder import SoftPromptTextEncoder
 
 logging.basicConfig(
     level=logging.INFO,
@@ -65,6 +71,9 @@ def parse_args() -> argparse.Namespace:
                         help="attention heads per layer (6–8; must divide head_hidden)")
     parser.add_argument("--head_pool",   choices=["mean", "token"], default="mean",
                         help="patch pooling: mean-pool or learnable aggregation token")
+    # ── CSP-style soft prompts (text-encoder targets) ──
+    parser.add_argument("--prompt_n_ctx", type=int, default=8,
+                        help="number of learnable soft-prompt context tokens per head")
     parser.add_argument(
         "--data_root",
         default="/scratch/tarunm10/datasets/release_dataset/images",
@@ -87,6 +96,7 @@ def save_checkpoint(
     step: int,
     epoch: int,
     primitive_heads: PrimitiveHeads,
+    soft_prompts: SoftPromptTextEncoder,
     loss_fn: InfoNCELoss,
     optimizer: torch.optim.Optimizer,
 ) -> None:
@@ -96,7 +106,10 @@ def save_checkpoint(
     CLIP is entirely frozen with no trainable parameters, so its weights are
     not checkpointed — CLIPEncoder.load_pretrained() deterministically
     reproduces the same backbone at eval/resume time, and skipping it avoids
-    duplicating a ~900 MB frozen model into every checkpoint file.
+    duplicating a ~900 MB frozen model into every checkpoint file. The
+    soft-prompt context vectors ARE checkpointed: they are the only
+    trainable parameters inside SoftPromptTextEncoder (its wrapped CLIP
+    model is frozen and excluded the same way).
     """
     CKPT_DIR.mkdir(exist_ok=True)
 
@@ -105,6 +118,12 @@ def save_checkpoint(
         "epoch":           epoch,
         "primitive_heads": primitive_heads.state_dict(),
         "head_config":     primitive_heads.config,
+        "soft_prompts":    {
+            "attr_ctx": soft_prompts.attr_ctx.detach().cpu(),
+            "obj_ctx":  soft_prompts.obj_ctx.detach().cpu(),
+            "comp_ctx": soft_prompts.comp_ctx.detach().cpu(),
+        },
+        "prompt_n_ctx":    soft_prompts.n_ctx,
         "loss_fn":         loss_fn.state_dict(),
         "optimizer":       optimizer.state_dict(),
     }
@@ -120,6 +139,7 @@ def save_checkpoint(
 
 def load_checkpoint(
     primitive_heads: PrimitiveHeads,
+    soft_prompts: SoftPromptTextEncoder,
     loss_fn: InfoNCELoss,
     optimizer: torch.optim.Optimizer,
 ) -> tuple[int, int]:
@@ -132,6 +152,12 @@ def load_checkpoint(
     state = torch.load(latest, map_location="cpu")
 
     primitive_heads.load_state_dict(state["primitive_heads"])
+    if "soft_prompts" in state:
+        device = soft_prompts.attr_ctx.device
+        with torch.no_grad():
+            soft_prompts.attr_ctx.copy_(state["soft_prompts"]["attr_ctx"].to(device))
+            soft_prompts.obj_ctx.copy_(state["soft_prompts"]["obj_ctx"].to(device))
+            soft_prompts.comp_ctx.copy_(state["soft_prompts"]["comp_ctx"].to(device))
     loss_fn.load_state_dict(state["loss_fn"])
     optimizer.load_state_dict(state["optimizer"])
 
@@ -199,28 +225,41 @@ def main() -> None:
         device=device,
     )
 
+    logger.info("Building SoftPromptTextEncoder …")
+    soft_prompts = SoftPromptTextEncoder(
+        clip_encoder.clip_model, n_ctx=args.prompt_n_ctx
+    ).to(device)
+
     loss_fn = InfoNCELoss().to(device)
 
     # ── Optimizer ─────────────────────────────────────────────────────────────
     # CLIP is fully frozen (no trainable projection head, unlike the old
-    # Y-encoder), so its parameters contribute no param group here.
+    # Y-encoder), so its parameters contribute no param group here. The
+    # soft-prompt context vectors are continuous embeddings, not weight
+    # matrices, so they are excluded from weight decay for the same reason
+    # LayerNorm/bias params and the temperature τ are (see
+    # models/primitive_heads.py::_split_decay_params).
     optimizer = torch.optim.AdamW(
         primitive_heads.param_groups(base_lr=args.lr)
-        + [{"params": loss_fn.parameters(), "lr": args.lr, "weight_decay": 0.0}],
+        + [{"params": loss_fn.parameters(), "lr": args.lr, "weight_decay": 0.0}]
+        + [{"params": soft_prompts.parameters(), "lr": args.lr, "weight_decay": 0.0}],
         weight_decay=0.05,
     )
 
     # ── Resume ────────────────────────────────────────────────────────────────
-    global_step, start_epoch = load_checkpoint(primitive_heads, loss_fn, optimizer)
+    global_step, start_epoch = load_checkpoint(
+        primitive_heads, soft_prompts, loss_fn, optimizer
+    )
 
     # ── Forward routing helper ──────────────────────────────────────────────
     # Returns (pred_embeds, target_embeds) for the head selected by batch_type.
     # `texts` already carries the mode-appropriate strings (attribute-only,
-    # object-only, or the full phrase), so the CLIP text targets are correct
-    # for each head without any further splitting here.
+    # object-only, or the full phrase); SoftPromptTextEncoder prepends that
+    # head's learnable context vectors before running CLIP's frozen text
+    # tower, so the targets are correct for each head without any further
+    # splitting here.
     def forward_batch(batch_type, patch_tokens, texts):
-        with torch.no_grad():
-            target_embeds = F.normalize(clip_encoder.get_text_features(texts), dim=-1)  # (B, 768)
+        target_embeds = F.normalize(soft_prompts(texts, head=batch_type), dim=-1)  # (B, 768)
         if batch_type == "attr":
             pred = primitive_heads.forward_attribute(patch_tokens)
         elif batch_type == "obj":
@@ -271,6 +310,7 @@ def main() -> None:
                     step=global_step,
                     epoch=epoch,
                     primitive_heads=primitive_heads,
+                    soft_prompts=soft_prompts,
                     loss_fn=loss_fn,
                     optimizer=optimizer,
                 )
@@ -279,6 +319,7 @@ def main() -> None:
             step=global_step,
             epoch=epoch + 1,
             primitive_heads=primitive_heads,
+            soft_prompts=soft_prompts,
             loss_fn=loss_fn,
             optimizer=optimizer,
         )

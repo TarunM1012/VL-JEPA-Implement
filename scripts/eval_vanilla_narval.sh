@@ -5,8 +5,8 @@
 #SBATCH --mem=40G
 #SBATCH --time=05:00:00
 #SBATCH --job-name=vljepa-vanilla-eval
-#SBATCH --output=logs/%x_%j/out.log
-#SBATCH --error=logs/%x_%j/err.log
+#SBATCH --output=logs/%x_%j.out
+#SBATCH --error=logs/%x_%j.err
 
 # Usage: sbatch eval_vanilla_narval.sh <checkpoint_path> [extra evaluate.py args]
 #
@@ -21,10 +21,7 @@ module load python/3.10
 module load cuda/12.2
 
 source ~/vljepa_env/bin/activate
-cd /lustre06/project/6001346/tarunm10/VL-JEPA-Implement
-
-# Create log dir — SLURM needs it to exist before writing
-mkdir -p logs/${SLURM_JOB_NAME}_${SLURM_JOB_ID}
+cd /lustre06/project/6001346/tarunm10/VL-JEPA-Implement-v3r2-soft-prompts
 
 CKPT_PATH="$1"
 if [ -z "$CKPT_PATH" ]; then

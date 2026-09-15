@@ -14,7 +14,7 @@ nvidia-smi
 python -c "import torch; print('CUDA available:', torch.cuda.is_available())"
 
 source ~/vljepa_env/bin/activate
-cd ~/VL-JEPA-Implement
+cd ~/VL-JEPA-Implement-clip-base
 
 export TRANSFORMERS_OFFLINE=1
 export HF_DATASETS_OFFLINE=1

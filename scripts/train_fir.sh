@@ -20,7 +20,7 @@ module load cuda/12.2
 source ~/vljepa_env/bin/activate
 
 # Move to project root on Lustre scratch (fast parallel filesystem)
-cd /lustre06/project/6001346/tarunm10/VL-JEPA-Implement
+cd /lustre06/project/6001346/tarunm10/VL-JEPA-Implement-clip-base
 
 # ---------------------------------------------------------------------------
 # Directory creation

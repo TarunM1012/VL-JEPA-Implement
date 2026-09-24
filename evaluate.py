@@ -7,19 +7,20 @@ Protocol
    closed-world candidate set, in three banks: attribute-only Y("attr"),
    object-only Y("obj"), and full-composition Y("attr obj").
 2. For each test image, run CLIPEncoder's visual tower once, then the three
-   primitive heads to produce attribute, object, and composition predictions
-   in the shared embedding space.  The composition prediction fuses the
-   attr/obj head outputs through the composition head.
+   primitive heads to produce attribute, object, and composition predictions.
 3. Three-branch scoring: each prediction is scored against its matching bank,
    then combined with λ weights into a per-pair score.
-4. Report seen accuracy, unseen accuracy, and harmonic mean (HM).
+4. Calibration: a bias γ is added to every unseen candidate's score. Instead of
+   sampling γ on a fixed grid, the exact seen/unseen accuracy curve is computed
+   (see `exact_calibration_curve`). Reports best seen, best unseen, best HM and
+   AUC, following the standard CZSL protocol (Purushwalkam et al., 2019;
+   Naeem et al., 2021).
 
 Seen / unseen split: pairs listed in train_pairs.txt are "seen"; all other
-vocabulary pairs (val + test only) are "unseen".
+candidate pairs are "unseen".
 
-Candidate set (closed-world): train_pairs ∪ phase_pairs (NOT the full 1962-pair
-vocab). For test: 1262 seen + 400 unseen = 1662 pairs. For val: 1262 seen +
-300 unseen = 1562 pairs. This matches the standard published protocol.
+Candidate set (closed-world): train_pairs ∪ phase_pairs. For test:
+1262 seen + 400 unseen = 1662 pairs. For val: 1262 seen + 300 unseen = 1562.
 """
 from __future__ import annotations
 
@@ -65,31 +66,24 @@ def parse_args() -> argparse.Namespace:
         default="/scratch/tarunm10/datasets/mit-states/compositional-split-natural",
         help="dir containing train/val/test_pairs.txt",
     )
-    parser.add_argument(
-        "--lambda_c", type=float, default=1.0,
-        help="weight for composition branch scoring (default: 1.0)",
-    )
-    parser.add_argument(
-        "--lambda_a", type=float, default=0.5,
-        help="weight for attribute branch scoring (default: 0.5)",
-    )
-    parser.add_argument(
-        "--lambda_o", type=float, default=0.5,
-        help="weight for object branch scoring (default: 0.5)",
-    )
+    parser.add_argument("--lambda_c", type=float, default=1.0,
+                        help="weight for composition branch scoring (default: 1.0)")
+    parser.add_argument("--lambda_a", type=float, default=0.5,
+                        help="weight for attribute branch scoring (default: 0.5)")
+    parser.add_argument("--lambda_o", type=float, default=0.5,
+                        help="weight for object branch scoring (default: 0.5)")
     parser.add_argument(
         "--phase", choices=["train", "val", "test"], default="test",
         help="which dataset split to evaluate (default: test)",
     )
     parser.add_argument(
         "--gamma_sweep", action=argparse.BooleanOptionalAction, default=True,
-        help="sweep calibration bias γ over [-2, 2] and report best HM + AUC "
-             "(disable with --no-gamma_sweep for single-pass eval)",
+        help="compute the exact calibration curve and report best seen / unseen / "
+             "HM and AUC (disable with --no-gamma_sweep for a single fixed-γ pass)",
     )
     parser.add_argument(
         "--gamma", type=float, default=0.0,
-        help="fixed calibration bias added to unseen pair scores at inference "
-            "(ignored when --gamma_sweep is active)",
+        help="fixed bias added to unseen pair scores (only used with --no-gamma_sweep)",
     )
     return parser.parse_args()
 
@@ -124,30 +118,84 @@ def encode_all_pairs(
     batch_size: int,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return three embedding banks: attribute, object, and composition.
-
-    Each is (num_pairs, 768) L2-normalised, matching the targets each head was
-    trained against:
-        attr bank : Y("attr")        — attribute word alone
-        obj  bank : Y("obj")         — object word alone
-        comp bank : Y("attr obj")    — the full composition phrase
+    """Return three L2-normalised embedding banks (num_pairs, 768):
+        attr bank : Y("attr")      obj bank : Y("obj")      comp bank : Y("attr obj")
     """
     attrs   = [attr            for attr, obj in pairs]
     objs    = [obj             for attr, obj in pairs]
     phrases = [f"{attr} {obj}" for attr, obj in pairs]
     attr_chunks, obj_chunks, comp_chunks = [], [], []
     for i in range(0, len(attrs), batch_size):
-        ae = F.normalize(clip_encoder.get_text_features(attrs[i   : i + batch_size]), dim=-1)
-        oe = F.normalize(clip_encoder.get_text_features(objs[i    : i + batch_size]), dim=-1)
-        ce = F.normalize(clip_encoder.get_text_features(phrases[i : i + batch_size]), dim=-1)
-        attr_chunks.append(ae.cpu())
-        obj_chunks.append(oe.cpu())
-        comp_chunks.append(ce.cpu())
-    return (
-        torch.cat(attr_chunks, dim=0),
-        torch.cat(obj_chunks,  dim=0),
-        torch.cat(comp_chunks, dim=0),
-    )
+        attr_chunks.append(F.normalize(clip_encoder.get_text_features(attrs[i : i + batch_size]), dim=-1).cpu())
+        obj_chunks.append(F.normalize(clip_encoder.get_text_features(objs[i : i + batch_size]), dim=-1).cpu())
+        comp_chunks.append(F.normalize(clip_encoder.get_text_features(phrases[i : i + batch_size]), dim=-1).cpu())
+    return torch.cat(attr_chunks), torch.cat(obj_chunks), torch.cat(comp_chunks)
+
+
+# ── Calibration curve ─────────────────────────────────────────────────────────
+
+def exact_calibration_curve(
+    scores: torch.Tensor,       # (N, C) base scores, candidate-space
+    gt: torch.Tensor,           # (N,)   ground-truth candidate index
+    seen_mask: torch.Tensor,    # (C,)   True for seen candidate pairs
+    gt_is_seen: torch.Tensor,   # (N,)   True when the ground-truth pair is seen
+) -> list[tuple[float, float, float]]:
+    """
+    Exact seen/unseen accuracy curve over every calibration bias.
+
+    A bias b is added to every unseen candidate's score. Each image predicts
+    its best SEEN pair until b exceeds (best_seen_score - best_unseen_score),
+    then flips to its best UNSEEN pair. Accuracy only changes at these flip
+    points, so sorting them yields every distinct operating point exactly —
+    no grid, nothing missed between samples.
+
+    Returns a list of (bias, seen_acc, unseen_acc), from bias = -inf upward.
+    Each row holds for biases just above its bias value.
+    """
+    neg_inf = torch.finfo(scores.dtype).min
+    s_max, s_idx = scores.masked_fill(~seen_mask, neg_inf).max(dim=1)   # best seen pair
+    u_max, u_idx = scores.masked_fill(seen_mask, neg_inf).max(dim=1)    # best unseen pair
+    thr = s_max - u_max                    # image flips to its unseen pick once bias > thr
+
+    ok_seen = (s_idx == gt)                # correct while predicting best seen
+    ok_unseen = (u_idx == gt)              # correct after flipping to best unseen
+    n_s = gt_is_seen.sum().item()
+    n_u = (~gt_is_seen).sum().item()
+
+    # Starting point (bias = -inf): every image predicts its best seen pair.
+    cs0 = (ok_seen & gt_is_seen).sum().item()
+    cu0 = (ok_seen & ~gt_is_seen).sum().item()
+
+    # Walk the flip points in order; each flip changes one image's correctness.
+    order = torch.argsort(thr)
+    delta = (ok_unseen.long() - ok_seen.long())[order]
+    flip_is_seen = gt_is_seen[order]
+    cs = cs0 + torch.cumsum(torch.where(flip_is_seen, delta, 0), dim=0)
+    cu = cu0 + torch.cumsum(torch.where(~flip_is_seen, delta, 0), dim=0)
+
+    curve = [(float("-inf"), cs0 / n_s, cu0 / n_u)]
+    curve += list(zip(thr[order].tolist(), (cs / n_s).tolist(), (cu / n_u).tolist()))
+    return curve
+
+
+def _hm(s: float, u: float) -> float:
+    return 2 * s * u / (s + u) if (s + u) > 0 else 0.0
+
+
+def summarize_curve(curve: list[tuple[float, float, float]]) -> dict:
+    """Standard CZSL metrics from the calibration curve."""
+    best = max(curve, key=lambda r: _hm(r[1], r[2]))
+    unseen = torch.tensor([r[2] for r in curve])
+    seen = torch.tensor([r[1] for r in curve])
+    return {
+        "best_seen":    max(r[1] for r in curve),
+        "best_unseen":  max(r[2] for r in curve),
+        "best_hm":      _hm(best[1], best[2]),
+        "seen_at_hm":   best[1],
+        "unseen_at_hm": best[2],
+        "bias_at_hm":   best[0],
+        "auc":          float(torch.trapezoid(seen, unseen).abs()),
+    }
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -157,14 +205,8 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info("Device: %s", device)
 
-    # ── Models ────────────────────────────────────────────────────────────────
-    clip_encoder, primitive_heads = load_models(
-        Path(args.checkpoint), device
-    )
+    clip_encoder, primitive_heads = load_models(Path(args.checkpoint), device)
 
-    # ── Datasets ──────────────────────────────────────────────────────────────
-    # Images are preprocessed with CLIP's own transform so pixel statistics
-    # match what the frozen visual tower expects.
     test_dataset = MITStatesDataset(
         transform=clip_encoder.preprocess,
         phase=args.phase,
@@ -172,190 +214,104 @@ def main() -> None:
         splits_root=args.split_root,
     )
 
-    # Seen pairs = those that appear in the training split file.
-    seen_pairs: set[tuple[str, str]] = set(
-        _load_pairs(Path(args.split_root) / "train_pairs.txt")
-    )
-
-    # Closed-world candidate set = seen (train) pairs + THIS phase's pairs.
-    # NOT the full 1962-pair vocab — the other phase's unseen pairs are
-    # distractors that inflate difficulty and break comparability with
-    # published numbers.
-    # test → 1262 seen + 400 unseen = 1662 pairs
-    # val  → 1262 seen + 300 unseen = 1562 pairs
-    phase_pairs: set[tuple[str, str]] = set(
-        _load_pairs(Path(args.split_root) / f"{args.phase}_pairs.txt")
-    )
+    # ── Candidate set: seen (train) pairs + this phase's pairs ────────────────
+    seen_pairs: set[tuple[str, str]] = set(_load_pairs(Path(args.split_root) / "train_pairs.txt"))
+    phase_pairs: set[tuple[str, str]] = set(_load_pairs(Path(args.split_root) / f"{args.phase}_pairs.txt"))
     candidate_pairs = sorted(seen_pairs | phase_pairs)
     cand2idx = {p: i for i, p in enumerate(candidate_pairs)}
 
-    _n_seen   = sum(1 for p in candidate_pairs if p in seen_pairs)
-    _n_unseen = len(candidate_pairs) - _n_seen
+    n_seen = sum(1 for p in candidate_pairs if p in seen_pairs)
     logger.info(
         "Candidate set: %d pairs (%d seen + %d unseen) for phase=%s",
-        len(candidate_pairs), _n_seen, _n_unseen, args.phase,
+        len(candidate_pairs), n_seen, len(candidate_pairs) - n_seen, args.phase,
     )
-    _expected = {"test": 1662, "val": 1562}
-    if args.phase in _expected and len(candidate_pairs) != _expected[args.phase]:
+    expected = {"test": 1662, "val": 1562}
+    if args.phase in expected and len(candidate_pairs) != expected[args.phase]:
         raise RuntimeError(
-            f"Candidate set size {len(candidate_pairs)} != expected "
-            f"{_expected[args.phase]} for phase={args.phase}. "
-            f"Verify split files at {args.split_root}."
+            f"Candidate set size {len(candidate_pairs)} != expected {expected[args.phase]} "
+            f"for phase={args.phase}. Verify split files at {args.split_root}."
         )
-
     logger.info("%s samples: %d", args.phase.capitalize(), len(test_dataset))
 
-    # ── Pre-compute three embedding banks over the candidate set ──────────────
+    # ── Text banks ────────────────────────────────────────────────────────────
     logger.info("Encoding %d pair texts via CLIP text encoder …", len(candidate_pairs))
-    attr_embeds_bank, obj_embeds_bank, comp_embeds_bank = encode_all_pairs(
-        clip_encoder, candidate_pairs, args.batch_size, device
+    attr_bank, obj_bank, comp_bank = (
+        b.to(device) for b in encode_all_pairs(clip_encoder, candidate_pairs, args.batch_size, device)
     )
-    attr_embeds_bank = attr_embeds_bank.to(device)   # (num_candidates, 768)
-    obj_embeds_bank  = obj_embeds_bank.to(device)
-    comp_embeds_bank = comp_embeds_bank.to(device)
+    logger.info("Scoring weights: λc=%.2f  λa=%.2f  λo=%.2f", args.lambda_c, args.lambda_a, args.lambda_o)
 
-    logger.info(
-        "Scoring weights: λc=%.2f  λa=%.2f  λo=%.2f",
-        args.lambda_c, args.lambda_a, args.lambda_o,
-    )
+    seen_mask = torch.tensor([p in seen_pairs for p in candidate_pairs], dtype=torch.bool)
 
-    # Boolean mask: True for candidate pairs that are seen (in train split).
-    seen_mask = torch.tensor(
-        [p in seen_pairs for p in candidate_pairs],
-        dtype=torch.bool, device=device,
-    )                                        # (num_candidates,)
-
-    # ── Evaluation loop ───────────────────────────────────────────────────────
-    # Collect per-image ground-truth indices and base scores so the
-    # γ sweep can reuse them without re-running the visual encoder.
-    all_scores:    list[torch.Tensor] = []   # each (B, num_candidates) on CPU
-    all_pair_idxs: list[torch.Tensor] = []   # each (B,) on CPU — vocab-space
-
+    # ── Score every test image against every candidate ────────────────────────
+    all_scores, all_pair_idxs = [], []
     test_loader = DataLoader(
-        test_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=4,
-        pin_memory=True,
+        test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True,
     )
-
     with torch.no_grad():
-        for batch_idx, (images, _texts, _attr_idxs, _obj_idxs, pair_idxs) in enumerate(
-            test_loader
-        ):
-            images    = images.to(device, non_blocking=True)  # (B, C, H, W)
-            pair_idxs = pair_idxs.to(device)                  # (B,) vocab-space
+        for batch_idx, (images, _texts, _a, _o, pair_idxs) in enumerate(test_loader):
+            images = images.to(device, non_blocking=True)
+            patch_tokens = clip_encoder.get_visual_features(images)          # (B, P, 1024)
 
-            # Step 1 — Visual encoding (shared by all three heads).
-            patch_tokens = clip_encoder.get_visual_features(images)  # (B, P, 1024)
+            attr_pred  = primitive_heads.forward_attribute(patch_tokens)     # (B, 768)
+            obj_pred   = primitive_heads.forward_object(patch_tokens)        # (B, 768)
+            visual_vec = F.normalize(patch_tokens.mean(dim=1), dim=-1)       # (B, 1024)
+            comp_pred  = primitive_heads.compose(attr_pred, obj_pred, visual_vec)
 
-            # Step 2 — Per-primitive predictions in the shared embedding space.
-            attr_pred  = primitive_heads.forward_attribute(patch_tokens)  # (B, 768)
-            obj_pred   = primitive_heads.forward_object(patch_tokens)     # (B, 768)
-            visual_vec = F.normalize(patch_tokens.mean(dim=1), dim=-1)    # (B, 1024)
-            comp_pred  = primitive_heads.compose(attr_pred, obj_pred, visual_vec)  # (B, 768)
-
-            # Step 3 — Three-branch λ-weighted base scores against candidate set.
             sims = (
-                args.lambda_c * (comp_pred @ comp_embeds_bank.T)
-              + args.lambda_a * (attr_pred @ attr_embeds_bank.T)
-              + args.lambda_o * (obj_pred  @ obj_embeds_bank.T)
-            )                                                  # (B, num_candidates)
-
+                args.lambda_c * (comp_pred @ comp_bank.T)
+              + args.lambda_a * (attr_pred @ attr_bank.T)
+              + args.lambda_o * (obj_pred  @ obj_bank.T)
+            )                                                                # (B, num_candidates)
             all_scores.append(sims.cpu())
-            all_pair_idxs.append(pair_idxs.cpu())
+            all_pair_idxs.append(pair_idxs)
 
             if (batch_idx + 1) % 20 == 0:
-                logger.info(
-                    "  processed %d / %d batches",
-                    batch_idx + 1, len(test_loader),
-                )
+                logger.info("  processed %d / %d batches", batch_idx + 1, len(test_loader))
 
-    # (N_test, num_candidates) base score matrix — built once, reused for γ sweep.
-    base_scores = torch.cat(all_scores,    dim=0)   # (N_test, num_candidates)
-    gt_indices  = torch.cat(all_pair_idxs, dim=0)   # (N_test,) — vocab-space
+    base_scores = torch.cat(all_scores)                                      # (N, num_candidates)
+    gt_vocab = torch.cat(all_pair_idxs).tolist()                             # full-vocab indices
+    gt_cand = torch.tensor([cand2idx[test_dataset.pairs[i]] for i in gt_vocab], dtype=torch.long)
+    gt_is_seen = torch.tensor([test_dataset.pairs[i] in seen_pairs for i in gt_vocab], dtype=torch.bool)
 
-    # Remap ground-truth indices from full vocab-space into candidate-set space.
-    # pair_idxs from the dataset indexes into the full 1962-pair vocab;
-    # our score matrix is num_candidates wide, so we must remap before argmax.
-    gt_cand_idx = torch.tensor(
-        [cand2idx[test_dataset.pairs[i]] for i in gt_indices.tolist()],
-        dtype=torch.long,
-    )                                                # (N_test,) — candidate-space
-
-    # Boolean GT membership: True when the ground-truth pair is seen.
-    gt_is_seen = torch.tensor(
-        [test_dataset.pairs[i] in seen_pairs for i in gt_indices.tolist()],
-        dtype=torch.bool,
-    )                                                # (N_test,)
-
-    seen_mask_cpu = seen_mask.cpu()                  # (num_candidates,) — for γ offset
-
-    # ── Helper: accuracy at a given score matrix ──────────────────────────────
-    def _accuracy(scores: torch.Tensor) -> tuple[float, float]:
-        if not args.gamma_sweep and args.gamma != 0.0:
-            scores = scores + args.gamma * (~seen_mask_cpu).float().unsqueeze(0)
-        preds   = scores.argmax(dim=1)               # (N_test,) — candidate-space
-        correct = preds == gt_cand_idx               # (N_test,) — remapped GT
-        s_acc = correct[gt_is_seen].float().mean().item()   if gt_is_seen.any()   else 0.0
-        u_acc = correct[~gt_is_seen].float().mean().item()  if (~gt_is_seen).any() else 0.0
-        return s_acc, u_acc
-
-    def _hm(s: float, u: float) -> float:
-        return 2 * s * u / (s + u) if (s + u) > 0 else 0.0
-
-    # ── Single-pass results (γ = 0, original behavior) ───────────────────────
-    seen_acc, unseen_acc = _accuracy(base_scores)
-    hm = _hm(seen_acc, unseen_acc)
-
+    # ── Single fixed-γ pass ───────────────────────────────────────────────────
     if not args.gamma_sweep:
+        scores = base_scores + args.gamma * (~seen_mask).float().unsqueeze(0)
+        correct = scores.argmax(dim=1) == gt_cand
+        s = correct[gt_is_seen].float().mean().item()
+        u = correct[~gt_is_seen].float().mean().item()
         print()
         print("=" * 52)
-        print("  VL-JEPA  |  MIT-States CZSL Results")
+        print(f"  VL-JEPA | MIT-States {args.phase} | fixed γ={args.gamma}")
         print("=" * 52)
-        print(f"  Seen accuracy   :  {seen_acc * 100:6.2f}%")
-        print(f"  Unseen accuracy :  {unseen_acc * 100:6.2f}%")
-        print(f"  Harmonic mean   :  {hm * 100:6.2f}%")
+        print(f"  Seen accuracy   :  {s * 100:6.2f}%")
+        print(f"  Unseen accuracy :  {u * 100:6.2f}%")
+        print(f"  Harmonic mean   :  {_hm(s, u) * 100:6.2f}%")
         print(f"  λc={args.lambda_c}  λa={args.lambda_a}  λo={args.lambda_o}")
         print("=" * 52)
-        print()
         return
 
-    # ── Calibration γ sweep ───────────────────────────────────────────────────
-    gammas = torch.linspace(-3.0, 3.0, 50).tolist()
-    rows: list[tuple[float, float, float, float]] = []  # (γ, seen, unseen, hm)
+    # ── Exact calibration curve ───────────────────────────────────────────────
+    curve = exact_calibration_curve(base_scores, gt_cand, seen_mask, gt_is_seen)
+    m = summarize_curve(curve)
 
-    unseen_mask_cpu = ~seen_mask_cpu  # candidate columns to offset
-    for gamma in gammas:
-        scores = base_scores.clone()
-        scores[:, unseen_mask_cpu] += gamma
-        s, u = _accuracy(scores)
-        rows.append((gamma, s, u, _hm(s, u)))
-
-    best = max(rows, key=lambda r: r[3])
-
-    # AUC: trapezoidal area under the seen-vs-unseen curve, sorted by unseen_acc.
-    pts = sorted(rows, key=lambda r: r[2])
-    xs  = [r[2] for r in pts]   # unseen axis
-    ys  = [r[1] for r in pts]   # seen axis
-    auc = float(torch.trapezoid(torch.tensor(ys), torch.tensor(xs)).abs())
-
-    # ── Print summary table ───────────────────────────────────────────────────
+    # Print ~20 evenly spaced points so the trade-off is visible in the log.
     W = 52
+    step = max(1, len(curve) // 20)
     print()
     print("=" * W)
-    print("  VL-JEPA | MIT-States CZSL Calibration Sweep")
+    print(f"  VL-JEPA | MIT-States {args.phase} | calibration curve")
     print("=" * W)
-    print(f"  {'γ':>6}   {'Seen':>8}   {'Unseen':>8}   {'HM':>8}")
+    print(f"  {'bias >':>10}   {'Seen':>8}   {'Unseen':>8}   {'HM':>8}")
     print("-" * W)
-    for gamma, s, u, h in rows:
-        marker = "  ← best" if (gamma, s, u, h) == best else ""
-        print(f"  {gamma:>6.2f}   {s*100:>7.2f}%   {u*100:>7.2f}%   {h*100:>7.2f}%{marker}")
+    for b, s, u in curve[::step]:
+        print(f"  {b:>10.4f}   {s*100:>7.2f}%   {u*100:>7.2f}%   {_hm(s, u)*100:>7.2f}%")
     print("=" * W)
-    print(f"  AUC: {auc * 100:.2f}%")
-    print(f"  Best HM: {best[3]*100:.2f}%  at γ={best[0]:.2f}")
-    print(f"  (Seen={best[1]*100:.2f}%, Unseen={best[2]*100:.2f}%)")
-    print(f"  λc={args.lambda_c}  λa={args.lambda_a}  λo={args.lambda_o}")
+    print(f"  Best seen   : {m['best_seen']*100:6.2f}%")
+    print(f"  Best unseen : {m['best_unseen']*100:6.2f}%")
+    print(f"  Best HM     : {m['best_hm']*100:6.2f}%   "
+          f"(seen {m['seen_at_hm']*100:.2f}%, unseen {m['unseen_at_hm']*100:.2f}%, bias > {m['bias_at_hm']:.4f})")
+    print(f"  AUC         : {m['auc']*100:6.2f}")
+    print(f"  λc={args.lambda_c}  λa={args.lambda_a}  λo={args.lambda_o}   points on curve: {len(curve)}")
     print("=" * W)
     print()
 

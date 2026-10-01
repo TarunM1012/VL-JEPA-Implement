@@ -4,8 +4,12 @@ CLIP encoder: frozen visual + text backbone for VL-JEPA target/context embedding
 Design summary
 --------------
 Backbone   : CLIP ViT-L/14 (openai/CLIP package, NOT HuggingFace transformers)
-Visual out : patch tokens from the final transformer block, BEFORE the CLS
-             projection layer — shape (B, num_patches, 1024) for ViT-L/14.
+Visual out : two tensors from one forward pass —
+             (a) patch tokens from the final transformer block, BEFORE the CLS
+                 projection layer — shape (B, num_patches, 1024) for ViT-L/14;
+             (b) CLIP's own image embedding (CLS → ln_post → proj), shape
+                 (B, embed_dim), i.e. exactly what `encode_image` returns. The
+                 residual heads predict a correction on top of it.
 Text out   : CLIP's own projected text embedding — shape (B, embed_dim), where
              embed_dim is read off the loaded checkpoint (768 for ViT-L/14;
              deliberately not hardcoded so this stays correct if the checkpoint
@@ -29,8 +33,10 @@ class CLIPEncoder(nn.Module):
     """
     Wraps a frozen CLIP ViT-L/14 model to expose two feature extractors:
 
-      get_visual_features(images) -> (B, num_patches, 1024) patch tokens from
-          the last transformer block, before CLIP's CLS projection head.
+      get_visual_features(images) -> (patch_tokens, image_embed):
+          (B, num_patches, 1024) patch tokens from the last transformer block
+          (before CLIP's CLS projection head), and (B, embed_dim) CLIP's own
+          image embedding from the same pass.
       get_text_features(texts)    -> (B, embed_dim) CLIP's own projected text
           embedding (embed_dim read from the checkpoint; 768 for ViT-L/14).
 
@@ -39,7 +45,7 @@ class CLIPEncoder(nn.Module):
     Typical usage
     -------------
     encoder = CLIPEncoder.load_pretrained(device=device)
-    visual_tokens = encoder.get_visual_features(images)   # (B, P, 1024)
+    visual_tokens, image_embed = encoder.get_visual_features(images)
     text_embeds   = encoder.get_text_features(texts)       # (B, embed_dim)
     """
 
@@ -83,16 +89,25 @@ class CLIPEncoder(nn.Module):
     # Visual features
     # ------------------------------------------------------------------
 
-    def get_visual_features(self, images: torch.Tensor) -> torch.Tensor:
+    def get_visual_features(
+        self, images: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             images: (B, C, H, W), already CLIP-preprocessed.
 
         Returns:
-            (B, num_patches, 1024) — patch tokens from the final transformer
-            block of the visual tower, CLS token dropped, before CLIP's
-            output projection (ln_post + proj are intentionally skipped so
-            the primitive heads see raw pre-projection patch features).
+            patch_tokens: (B, num_patches, 1024) — patch tokens from the final
+                transformer block of the visual tower, CLS token dropped,
+                before CLIP's output projection (ln_post + proj are
+                intentionally skipped so the primitive heads see raw
+                pre-projection patch features).
+            image_embed: (B, text_dim) — CLIP's own image embedding, the CLS
+                token taken through ln_post + proj, bit-identical to
+                `clip_model.encode_image(images)`. Not L2-normalised, matching
+                get_text_features. Both come out of one transformer pass: the
+                residual heads need both every step, and running the visual
+                tower twice would double the frozen-backbone cost.
         """
         visual = self.clip_model.visual
         dtype = visual.conv1.weight.dtype
@@ -114,7 +129,14 @@ class CLIPEncoder(nn.Module):
             x = x.permute(1, 0, 2)                                 # LND -> NLD
 
             patch_tokens = x[:, 1:, :]                             # drop CLS token
-            return patch_tokens.float()
+
+            # CLIP's own image embedding: same two lines as CLIP's
+            # VisionTransformer.forward tail, so this matches encode_image().
+            image_embed = visual.ln_post(x[:, 0, :])
+            if visual.proj is not None:
+                image_embed = image_embed @ visual.proj
+
+            return patch_tokens.float(), image_embed.float()
 
     # ------------------------------------------------------------------
     # Text features
@@ -154,16 +176,32 @@ if __name__ == "__main__":
     images = torch.randn(2, 3, 224, 224, device=device)
     texts = ["a red car", "a green apple"]
 
-    visual_tokens = encoder.get_visual_features(images)
+    visual_tokens, image_embed = encoder.get_visual_features(images)
     text_embeds = encoder.get_text_features(texts)
 
     print(f"Visual tokens shape : {tuple(visual_tokens.shape)}")
+    print(f"Image embed shape   : {tuple(image_embed.shape)}")
     print(f"Text embeds shape   : {tuple(text_embeds.shape)}")
 
     assert visual_tokens.shape[0] == 2 and visual_tokens.shape[2] == _VISUAL_DIM, (
         f"Visual shape mismatch: {tuple(visual_tokens.shape)}"
     )
+    assert tuple(image_embed.shape) == (2, encoder.text_dim), (
+        f"Image embed shape mismatch: got {tuple(image_embed.shape)}, "
+        f"expected (2, {encoder.text_dim})"
+    )
     assert tuple(text_embeds.shape) == (2, encoder.text_dim), (
         f"Text shape mismatch: got {tuple(text_embeds.shape)}, expected (2, {encoder.text_dim})"
     )
-    print("Shape check passed.")
+
+    # The residual heads build on this embedding, so it must be the same vector
+    # CLIP's own zero-shot path uses — otherwise the "starts as zero-shot CLIP"
+    # property silently does not hold.
+    with torch.no_grad():
+        reference = encoder.clip_model.encode_image(
+            images.to(encoder.clip_model.visual.conv1.weight.dtype)
+        ).float()
+    max_diff = (image_embed - reference).abs().max().item()
+    print(f"max |ours - encode_image| : {max_diff:.2e}")
+    assert max_diff < 1e-4, f"image_embed diverges from encode_image: {max_diff}"
+    print("Shape + parity check passed.")

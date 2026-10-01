@@ -73,6 +73,35 @@ Not yet done: a real training run (explicitly out of scope for this pass — sub
 
 **Key architectural decision for 40%+ (not yet implemented):** Intermediate CLIP layer access on attr/obj heads (CAMS precedent — last M transformer blocks via cross-attention with learnable latent queries). Final-block patch tokens alone are what's implemented now; lower layers carrying more attribute-relevant local texture information is the next lever toward the 40%+ target.
 
+---
+
+## Residual heads (v3r1-residual-heads branch — implemented, untrained)
+
+**Problem addressed:** the heads were trained from scratch on top of frozen CLIP, predicting text embeddings from nothing. CLIP's image/text alignment — the thing that makes zero-shot CLIP score 26.4% HM with no training at all — was discarded and had to be relearned from 34k images. A randomly initialised head starts far below the zero-shot floor and spends its budget climbing back to it.
+
+**Change:** each head now predicts a *gated correction* on CLIP's own image embedding instead of predicting the target embedding outright:
+
+```
+pred = normalise( normalise(clip_image_embed) + α · correction(patch_tokens) )
+```
+
+- `clip_image_embed` is CLIP's own image embedding (CLS → `ln_post` → `proj`), i.e. exactly what `encode_image` returns, verified bit-exact (max abs diff 0.0) against `encode_image` on real weights.
+- `α` (`residual_scale`) is one learnable scalar per head, initialised to **zero**. At step 0 every head's prediction is therefore exactly the normalised CLIP image embedding — training *starts* as zero-shot CLIP and can only move away as far as the InfoNCE objective pays for.
+- The base is normalised before the correction is added: raw CLIP image embeddings have norms around 10 and would otherwise swamp the correction.
+- α is excluded from weight decay, same rationale as the InfoNCE temperature τ (decay would be a standing pull back toward pure CLIP, fighting the loss every step).
+- Applied to all three heads (attr, obj, comp), so the three-branch inference score at init is a pure zero-shot-CLIP ensemble.
+- Cost: +1 parameter per head (30.20M total, unchanged to 2dp) and **no** extra backbone compute — `CLIPEncoder.get_visual_features` now returns `(patch_tokens, image_embed)` from a single visual-tower pass.
+
+**Why a gate and not just a zero-initialised output projection** (measured, not assumed): a zero-init final projection also starts at CLIP, but nothing bounds how fast the correction then grows. Measured on real CLIP features at the default lr=5e-5, the correction's norm reaches **0.54 after one AdamW step** and **~2.8 by step 50** against a unit-norm base — cos(pred, CLIP) falls to 0.10, i.e. CLIP's alignment is thrown away again, just a few steps later than before. AdamW's update is ~lr per *parameter*, so a full projection matrix moves the output far more than the learning rate suggests. Routing the correction through a single scalar makes the distance from CLIP move at roughly the learning rate per step instead.
+
+**Observability:** train.py logs both `a_attr / a_obj / a_comp` (the gates) and `cos_clip` (mean cosine between the prediction and the normalised CLIP image embedding) every 10 steps. `cos_clip` is the honest measure — 1.0 means the head is still exactly zero-shot CLIP. α alone understates the departure, because the correction's own norm grows alongside the gate: in the 300-step probe below α reached only 0.005 while `cos_clip` fell to 0.14, i.e. the correction's norm had grown to ~7. Worth reporting in the paper: how far the objective actually chose to move from CLIP is a direct statement about how much the primitive heads add over CLIP's own alignment.
+
+**Measured gate trajectory** (8 synthetic samples, real CLIP ViT-B/32 features, lr=5e-5 — a deliberately degenerate memorisation probe, so real training moves far slower): `cos_clip` 1.0000 at step 0, 1.0000 at step 20, 0.88 at step 50, 0.51 at step 100, 0.14 at step 300. The departure is gradual and monotone, versus the ungated zero-init projection which was already at 0.87 after one step.
+
+**Backward compatibility:** `residual` defaults to `False` in `PrimitiveHeads.build`, and `build` records it in `head_config`. Checkpoints written before this change have no `residual` key, so evaluate.py rebuilds them non-residual — matching how they were trained. `train.py --no-residual` reproduces the pre-residual baseline. Non-residual heads register no `residual_scale` parameter, so strict `load_state_dict` works in both directions.
+
+**Not yet done:** no training run. The comparison that matters is v3 (non-residual) vs. v3r1 (residual) vs. the 26.4% zero-shot floor from `zero_shot_clip.py`.
+
 **What stayed identical:** `PrimitiveBatchSampler`, `evaluate.py`'s three-branch scoring (λc=1.0/λa=0.5/λo=0.5) and γ-calibration protocol, the per-head InfoNCE training loop structure in `train.py`.
 
 ---

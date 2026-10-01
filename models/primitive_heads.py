@@ -26,6 +26,45 @@ All heads emit L2-normalised 768-dim vectors so that a dot product equals
 cosine similarity, matching `InfoNCELoss` and CLIP's text-projection geometry
 (ViT-L/14's projected embed dim).
 
+Residual prediction (`residual=True`)
+-------------------------------------
+A head built from scratch on top of frozen CLIP starts out predicting noise,
+so it must relearn CLIP's image/text alignment before it can beat zero-shot
+CLIP at all.  With `residual=True` a head instead predicts a *correction* on
+CLIP's own image embedding:
+
+    pred = normalise( normalise(clip_image_embed) + α · correction(tokens) )
+
+α (`residual_scale`) is a single learnable scalar initialised to zero, so the
+prediction starts out exactly equal to the normalised CLIP image embedding:
+the model begins training as zero-shot CLIP and moves away from it only as far
+as the InfoNCE objective pays for.
+
+The gate is what makes the correction *small*, not just zero at step 0.  A
+bare zero-initialised output projection also starts at CLIP, but nothing then
+bounds how fast the correction grows — measured on real CLIP features at the
+default lr=5e-5 its norm reaches 0.5 after a single AdamW step and ~2.8 (vs. a
+unit-norm base) by step 50, which throws CLIP's alignment away again just a few
+steps later than before.  AdamW moves each parameter by about the learning rate
+per step, so a whole projection matrix shifts the output far more than the
+learning rate suggests; routing the correction through one scalar makes the
+departure from CLIP gradual instead.
+
+α is not itself the distance from CLIP — the correction's own norm grows
+alongside the gate — so train.py logs both α and the mean cosine between the
+prediction and the CLIP embedding (`cos_clip`, 1.0 = still exactly zero-shot
+CLIP), which is the honest measure.
+
+α is excluded from weight decay for the same reason as the InfoNCE temperature:
+decay would pull it toward zero independently of what the loss wants.
+
+The frozen base carries no gradient, so this costs 1 parameter per head and no
+extra backbone compute (`CLIPEncoder.get_visual_features` returns the patch
+tokens and the image embedding from the same pass).
+
+`residual=False` keeps the original behaviour (prediction is the head output
+alone) so that pre-residual checkpoints still evaluate faithfully.
+
 Loss routing
 ------------
 Each head is trained only on its corresponding batch type emitted by
@@ -59,6 +98,30 @@ _SHARED_DIM = 768    # CLIP ViT-L/14 projected text embedding dim (image/text sh
 Pool = Literal["mean", "token"]
 
 
+def _finalise(
+    correction: torch.Tensor,
+    image_embed: Optional[torch.Tensor],
+    scale: Optional[nn.Parameter],
+) -> torch.Tensor:
+    """
+    Turn a head's raw output into its L2-normalised prediction.
+
+    `scale` is None for a non-residual head: the output *is* the prediction.
+    Otherwise the output is a gated correction on CLIP's image embedding. The
+    base is normalised first so the gate is relative to a unit vector — CLIP's
+    raw image embeddings have norms around 10, which would otherwise swamp the
+    correction entirely.
+    """
+    if scale is None:
+        return F.normalize(correction, dim=-1)
+    if image_embed is None:
+        raise ValueError(
+            "residual=True heads need image_embed "
+            "(CLIPEncoder.get_visual_features returns it alongside the patch tokens)"
+        )
+    return F.normalize(F.normalize(image_embed, dim=-1) + scale * correction, dim=-1)
+
+
 # ----------------------------------------------------------------------
 # Transformer head (attribute / object)
 # ----------------------------------------------------------------------
@@ -75,6 +138,7 @@ class TransformerHead(nn.Module):
             └─ TransformerEncoder     ─► (B, S, hidden_dim)   (no causal mask)
             └─ pool (mean | CLS token)─► (B, hidden_dim)
             └─ output_proj            ─► (B, 768)
+            └─ [+ normalised CLIP image embedding, if residual]
             └─ L2-normalise           ─► (B, 768)
 
     The encoder is bidirectional by construction: `nn.TransformerEncoder`
@@ -98,6 +162,9 @@ class TransformerHead(nn.Module):
                      embeddings consumed by the composition head are
                      deterministic; the contrastive objective + per-primitive
                      batching already provide regularisation.
+        residual   : predict a correction on CLIP's image embedding instead of
+                     the embedding itself (see module docstring).  Requires
+                     `image_embed` to be passed to forward().
     """
 
     def __init__(
@@ -110,6 +177,7 @@ class TransformerHead(nn.Module):
         output_dim: int = _SHARED_DIM,
         pool: Pool = "mean",
         dropout: float = 0.0,
+        residual: bool = False,
     ) -> None:
         super().__init__()
 
@@ -120,6 +188,16 @@ class TransformerHead(nn.Module):
             )
         self.pool = pool
         self.hidden_dim = hidden_dim
+
+        # Learnable gate on the correction; None (and absent from the state
+        # dict) for a non-residual head. Zero init ⇒ the prediction starts as
+        # CLIP's own embedding. The transformer body gets no gradient on the
+        # very first step (dL/dbody ∝ α = 0); α itself does, so from step 2 on
+        # everything trains.
+        if residual:
+            self.residual_scale = nn.Parameter(torch.zeros(1))
+        else:
+            self.register_parameter("residual_scale", None)
 
         # Project ViT patch tokens into the transformer width.
         self.input_proj = nn.Linear(visual_dim, hidden_dim)
@@ -159,16 +237,25 @@ class TransformerHead(nn.Module):
         n_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
         logger.info(
             "TransformerHead: hidden=%d layers=%d heads=%d ffn=%d pool=%s "
-            "| %.2f M params",
+            "residual=%s | %.2f M params",
             hidden_dim, num_layers, num_heads, hidden_dim * ffn_mult,
-            pool, n_params / 1e6,
+            pool, residual, n_params / 1e6,
         )
 
-    def forward(self, visual_embeds: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        visual_embeds: torch.Tensor,
+        image_embed: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         Args:
             visual_embeds : (B, num_patches, visual_dim) patch tokens from
                             the X-encoder.
+            image_embed   : (B, output_dim) CLIP's own image embedding; the
+                            base the correction is added to.  Required when
+                            `residual=True`, ignored otherwise.  Need not be
+                            normalised — it is normalised here so the
+                            correction's scale is relative to a unit vector.
 
         Returns:
             (B, output_dim) L2-normalised embeddings.
@@ -189,7 +276,7 @@ class TransformerHead(nn.Module):
             pooled = x.mean(dim=1)                        # mean over tokens → (B, hidden_dim)
 
         projected = self.output_proj(pooled)              # (B, output_dim)
-        return F.normalize(projected, dim=-1)
+        return _finalise(projected, image_embed, self.residual_scale)
 
 
 # ----------------------------------------------------------------------
@@ -212,6 +299,8 @@ class CompositionHead(nn.Module):
         fusion    : "concat" → input is [attr ; obj]  (2*embed_dim)
                     "sum"    → input is attr + obj     (embed_dim)
         dropout   : MLP dropout.
+        residual  : predict a correction on CLIP's image embedding instead of
+                    the embedding itself (see module docstring).
     """
 
     def __init__(
@@ -222,12 +311,19 @@ class CompositionHead(nn.Module):
         fusion: Literal["concat", "sum"] = "concat",
         dropout: float = 0.0,
         visual_dim: int = _VISUAL_DIM,
+        residual: bool = False,
     ) -> None:
         super().__init__()
 
         if num_layers < 2:
             raise ValueError(f"CompositionHead needs >=2 layers, got {num_layers}")
         self.fusion = fusion
+
+        # Same zero-initialised gate as TransformerHead (see module docstring).
+        if residual:
+            self.residual_scale = nn.Parameter(torch.zeros(1))
+        else:
+            self.register_parameter("residual_scale", None)
 
         in_dim = 2 * embed_dim + visual_dim if fusion == "concat" else embed_dim
 
@@ -245,8 +341,8 @@ class CompositionHead(nn.Module):
 
         n_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
         logger.info(
-            "CompositionHead: fusion=%s layers=%d hidden=%d | %.2f M params",
-            fusion, num_layers, hidden_dim, n_params / 1e6,
+            "CompositionHead: fusion=%s layers=%d hidden=%d residual=%s | %.2f M params",
+            fusion, num_layers, hidden_dim, residual, n_params / 1e6,
         )
 
     def forward(
@@ -254,6 +350,7 @@ class CompositionHead(nn.Module):
         attr_embed: torch.Tensor,   # (B, embed_dim), L2-normalised
         obj_embed: torch.Tensor,    # (B, embed_dim), L2-normalised
         visual_vec: torch.Tensor,   # (B, visual_dim), L2-normalised mean-pooled patch tokens
+        image_embed: Optional[torch.Tensor] = None,  # (B, embed_dim), CLIP image embedding
     ) -> torch.Tensor:
         """Returns (B, embed_dim) L2-normalised composition embeddings."""
         if self.fusion == "concat":
@@ -261,7 +358,7 @@ class CompositionHead(nn.Module):
         else:  # "sum"
             x = attr_embed + obj_embed                       # (B, embed_dim)
         out = self.mlp(x)                                    # (B, embed_dim)
-        return F.normalize(out, dim=-1)
+        return _finalise(out, image_embed, self.residual_scale)
 
 
 # ----------------------------------------------------------------------
@@ -272,11 +369,13 @@ def _split_decay_params(module: nn.Module) -> tuple[List[nn.Parameter], List[nn.
     """
     Split a module's parameters into (decay, no_decay) groups for AdamW.
 
-    LayerNorm weight/bias and all Linear biases should not be weight-decayed:
-    decaying them pulls the value toward zero for no principled reason,
-    fighting whatever the task loss is doing to it every step (same
-    rationale as not decaying the InfoNCE temperature). Matched by module
-    type (nn.LayerNorm) rather than name substring, since
+    LayerNorm weight/bias, all Linear biases, and the residual gate should not
+    be weight-decayed: decaying them pulls the value toward zero for no
+    principled reason, fighting whatever the task loss is doing to it every
+    step (same rationale as not decaying the InfoNCE temperature). For the
+    residual gate specifically, decay would be a standing pull back toward
+    pure CLIP that the loss has to fight on every step. Norms are matched by
+    module type (nn.LayerNorm) rather than name substring, since
     nn.TransformerEncoderLayer names its norms "norm1"/"norm2", not
     "LayerNorm" — a literal string match would miss them.
     """
@@ -290,7 +389,8 @@ def _split_decay_params(module: nn.Module) -> tuple[List[nn.Parameter], List[nn.
     for name, p in module.named_parameters():
         if id(p) in no_decay_ids:
             continue
-        (no_decay if name.endswith("bias") else decay).append(p)
+        skip = name.endswith("bias") or name.endswith("residual_scale")
+        (no_decay if skip else decay).append(p)
     return decay, no_decay
 
 
@@ -303,11 +403,14 @@ class PrimitiveHeads(nn.Module):
     Bundles the attribute, object, and composition heads behind one module so
     training/eval/checkpointing treat them as a unit.
 
-    Forward entry points (one per batch type):
-        forward_attribute(visual)    → (B, 768)   train on attr-batches
-        forward_object(visual)       → (B, 768)   train on obj-batches
-        forward_composition(visual)  → (B, 768)   train on comp-batches
-        compose(attr_embed, obj_embed) → (B, 768) reuse precomputed embeds
+    Forward entry points (one per batch type).  `image_embed` is CLIP's own
+    image embedding for the same images; it is the residual base and is
+    required when the heads were built with `residual=True`:
+        forward_attribute(visual, image_embed)   → (B, 768)  attr-batches
+        forward_object(visual, image_embed)      → (B, 768)  obj-batches
+        forward_composition(visual, image_embed) → (B, 768)  comp-batches
+        compose(attr_embed, obj_embed, visual_vec, image_embed) → (B, 768)
+            reuse precomputed embeds
     """
 
     def __init__(
@@ -339,20 +442,27 @@ class PrimitiveHeads(nn.Module):
         comp_layers: int = 3,
         comp_hidden: int = _SHARED_DIM,
         comp_visual_dim: int = _VISUAL_DIM,
+        residual: bool = False,
         device: Optional[torch.device] = None,
     ) -> "PrimitiveHeads":
-        """Construct all three heads with shared transformer hyperparameters."""
+        """
+        Construct all three heads with shared transformer hyperparameters.
+
+        `residual` defaults to False so that checkpoints written before the
+        residual change — whose `head_config` has no `residual` key — rebuild
+        with their original behaviour when evaluate.py splats the config.
+        """
         attr_head = TransformerHead(
             hidden_dim=hidden_dim, num_layers=num_layers, num_heads=num_heads,
-            ffn_mult=ffn_mult, pool=pool, dropout=head_dropout,
+            ffn_mult=ffn_mult, pool=pool, dropout=head_dropout, residual=residual,
         )
         obj_head = TransformerHead(
             hidden_dim=hidden_dim, num_layers=num_layers, num_heads=num_heads,
-            ffn_mult=ffn_mult, pool=pool, dropout=head_dropout,
+            ffn_mult=ffn_mult, pool=pool, dropout=head_dropout, residual=residual,
         )
         comp_head = CompositionHead(
             hidden_dim=comp_hidden, num_layers=comp_layers, fusion=comp_fusion,
-            visual_dim=comp_visual_dim,
+            visual_dim=comp_visual_dim, residual=residual,
         )
         instance = cls(attr_head, obj_head, comp_head)
 
@@ -363,7 +473,7 @@ class PrimitiveHeads(nn.Module):
             hidden_dim=hidden_dim, num_layers=num_layers, num_heads=num_heads,
             ffn_mult=ffn_mult, pool=pool, head_dropout=head_dropout,
             comp_fusion=comp_fusion, comp_layers=comp_layers, comp_hidden=comp_hidden,
-            comp_visual_dim=comp_visual_dim,
+            comp_visual_dim=comp_visual_dim, residual=residual,
         )
 
         total = sum(p.numel() for p in instance.parameters() if p.requires_grad)
@@ -397,22 +507,50 @@ class PrimitiveHeads(nn.Module):
 
     # ---- Forward entry points ---------------------------------------------
 
-    def forward_attribute(self, visual_embeds: torch.Tensor) -> torch.Tensor:
-        return self.attr_head(visual_embeds)
+    def residual_scales(self) -> dict:
+        """
+        Current gate value per head — how far each head has moved from CLIP's
+        own embedding. Empty dict when the heads were built non-residual.
+        """
+        return {
+            name: head.residual_scale.item()
+            for name, head in (
+                ("attr", self.attr_head),
+                ("obj", self.obj_head),
+                ("comp", self.comp_head),
+            )
+            if head.residual_scale is not None
+        }
 
-    def forward_object(self, visual_embeds: torch.Tensor) -> torch.Tensor:
-        return self.obj_head(visual_embeds)
+    def forward_attribute(
+        self,
+        visual_embeds: torch.Tensor,
+        image_embed: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        return self.attr_head(visual_embeds, image_embed)
+
+    def forward_object(
+        self,
+        visual_embeds: torch.Tensor,
+        image_embed: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        return self.obj_head(visual_embeds, image_embed)
 
     def compose(
         self,
         attr_embed: torch.Tensor,
         obj_embed: torch.Tensor,
         visual_vec: torch.Tensor,
+        image_embed: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Fuse precomputed attr/obj embeddings and visual_vec (used at eval time)."""
-        return self.comp_head(attr_embed, obj_embed, visual_vec)
+        return self.comp_head(attr_embed, obj_embed, visual_vec, image_embed)
 
-    def forward_composition(self, visual_embeds: torch.Tensor) -> torch.Tensor:
+    def forward_composition(
+        self,
+        visual_embeds: torch.Tensor,
+        image_embed: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         Composition prediction from raw visual tokens.
 
@@ -425,10 +563,10 @@ class PrimitiveHeads(nn.Module):
         it carries no grad so it does not break the gradient isolation.
         """
         with torch.no_grad():
-            attr_embed = self.attr_head(visual_embeds)
-            obj_embed = self.obj_head(visual_embeds)
+            attr_embed = self.attr_head(visual_embeds, image_embed)
+            obj_embed = self.obj_head(visual_embeds, image_embed)
         visual_vec = F.normalize(visual_embeds.mean(dim=1), dim=-1)  # (B, 1024)
-        return self.comp_head(attr_embed, obj_embed, visual_vec)
+        return self.comp_head(attr_embed, obj_embed, visual_vec, image_embed)
 
 
 # ----------------------------------------------------------------------
@@ -491,5 +629,41 @@ if __name__ == "__main__":
     assert any(p.grad is not None for p in heads.attr_head.parameters())
     assert all(p.grad is None for p in heads.obj_head.parameters())
     print("[check 4] attr-batch grads isolated to attribute head ✓")
+
+    # ---- Check 5: residual heads start exactly at the CLIP embedding ------
+    res_heads = PrimitiveHeads.build(residual=True)
+    image_embed = torch.randn(B, _SHARED_DIM) * 10.0   # CLIP embeds are not unit-norm
+    base = F.normalize(image_embed, dim=-1)
+    for name, out in [
+        ("attr", res_heads.forward_attribute(visual, image_embed)),
+        ("obj",  res_heads.forward_object(visual, image_embed)),
+        ("comp", res_heads.forward_composition(visual, image_embed)),
+    ]:
+        assert torch.allclose(out, base, atol=1e-6), \
+            f"{name} residual head does not start at the CLIP image embedding"
+    print("[check 5] untrained residual heads == normalised CLIP image embedding ✓")
+
+    # ---- Check 6: the zero-init gate still receives gradient ---------------
+    res_heads.zero_grad(set_to_none=True)
+    res_heads.forward_attribute(visual, image_embed).sum().backward()
+    g = res_heads.attr_head.residual_scale.grad
+    assert g is not None and g.abs().max() > 0, \
+        "zero-initialised residual gate got no gradient — the head can never leave CLIP"
+    print("[check 6] zero-init residual gate receives gradient ✓")
+
+    # ---- Check 6b: the gate is excluded from weight decay ------------------
+    decay, no_decay = _split_decay_params(res_heads.attr_head)
+    gate_id = id(res_heads.attr_head.residual_scale)
+    assert gate_id in {id(p) for p in no_decay}, "residual gate landed in the decay group"
+    assert gate_id not in {id(p) for p in decay}
+    print("[check 6b] residual gate excluded from weight decay ✓")
+
+    # ---- Check 7: residual heads refuse to run without the base ----------
+    try:
+        res_heads.forward_attribute(visual)
+    except ValueError:
+        print("[check 7] residual head without image_embed raises ✓")
+    else:
+        raise AssertionError("residual head silently ran without image_embed")
 
     print("\nAll checks passed.")

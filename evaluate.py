@@ -6,8 +6,11 @@ Protocol
 1. Pre-compute CLIP text embeddings for every (attr, obj) pair in the
    closed-world candidate set, in three banks: attribute-only Y("attr"),
    object-only Y("obj"), and full-composition Y("attr obj").
-2. For each test image, run CLIPEncoder's visual tower once, then the three
-   primitive heads to produce attribute, object, and composition predictions.
+2. For each test image, run CLIPEncoder's visual tower once — yielding patch
+   tokens plus CLIP's own image embedding — then the three primitive heads to
+   produce attribute, object, and composition predictions. For residual
+   checkpoints each prediction is CLIP's image embedding plus the head's
+   learned correction.
 3. Three-branch scoring: each prediction is scored against its matching bank,
    then combined with λ weights into a per-pair score.
 4. Calibration: a bias γ is added to every unseen candidate's score. Instead of
@@ -102,6 +105,9 @@ def load_models(
 
     logger.info("Building PrimitiveHeads …")
     head_config = state.get("head_config") or {}
+    # Checkpoints from before the residual change carry no "residual" key, so
+    # they rebuild non-residual — matching how they were trained.
+    logger.info("Head residual mode: %s", head_config.get("residual", False))
     primitive_heads = PrimitiveHeads.build(device=device, **head_config)
     primitive_heads.load_state_dict(state["primitive_heads"])
     primitive_heads.eval()
@@ -250,12 +256,15 @@ def main() -> None:
     with torch.no_grad():
         for batch_idx, (images, _texts, _a, _o, pair_idxs) in enumerate(test_loader):
             images = images.to(device, non_blocking=True)
-            patch_tokens = clip_encoder.get_visual_features(images)          # (B, P, 1024)
+            # patch tokens (B, P, 1024) + CLIP's own image embedding (B, 768);
+            # the latter is the residual base the heads correct (ignored by
+            # non-residual checkpoints).
+            patch_tokens, image_embed = clip_encoder.get_visual_features(images)
 
-            attr_pred  = primitive_heads.forward_attribute(patch_tokens)     # (B, 768)
-            obj_pred   = primitive_heads.forward_object(patch_tokens)        # (B, 768)
+            attr_pred  = primitive_heads.forward_attribute(patch_tokens, image_embed)
+            obj_pred   = primitive_heads.forward_object(patch_tokens, image_embed)
             visual_vec = F.normalize(patch_tokens.mean(dim=1), dim=-1)       # (B, 1024)
-            comp_pred  = primitive_heads.compose(attr_pred, obj_pred, visual_vec)
+            comp_pred  = primitive_heads.compose(attr_pred, obj_pred, visual_vec, image_embed)
 
             sims = (
                 args.lambda_c * (comp_pred @ comp_bank.T)

@@ -13,10 +13,16 @@ type, routed by `RoutingDataLoader` (see data/primitive_sampler.py):
 Pipeline per batch
 ------------------
 images (B, C, H, W)    ──►  CLIPEncoder.get_visual_features
-                        ──►  patch tokens (B, P, 1024)
+                        ──►  patch tokens (B, P, 1024) + CLIP image embed (B, 768)
 texts List[str]        ──►  CLIPEncoder.get_text_features   ──►  target embeds (B, 768)
-patch tokens           ──►  one head                        ──►  pred embeds   (B, 768)
+patch tokens + image embed ──►  one head                    ──►  pred embeds   (B, 768)
 pred + target          ──►  InfoNCELoss                     ──►  scalar loss (backprop one head)
+
+With --residual (default), each head predicts a gated correction on CLIP's own
+image embedding rather than the embedding outright, and the gate starts at zero
+— so training starts from zero-shot CLIP instead of from noise, and the gate
+value (logged as a_attr / a_obj / a_comp) shows how far each head has chosen to
+move away from it.  See models/primitive_heads.py.
 """
 
 import argparse
@@ -65,6 +71,12 @@ def parse_args() -> argparse.Namespace:
                         help="attention heads per layer (6–8; must divide head_hidden)")
     parser.add_argument("--head_pool",   choices=["mean", "token"], default="mean",
                         help="patch pooling: mean-pool or learnable aggregation token")
+    parser.add_argument(
+        "--residual", action=argparse.BooleanOptionalAction, default=True,
+        help="predict a zero-initialised correction on CLIP's image embedding, so "
+             "training starts as zero-shot CLIP (disable with --no-residual for the "
+             "pre-residual baseline)",
+    )
     parser.add_argument(
         "--data_root",
         default="/scratch/tarunm10/datasets/release_dataset/images",
@@ -196,6 +208,7 @@ def main() -> None:
         num_layers=args.head_layers,
         num_heads=args.head_heads,
         pool=args.head_pool,
+        residual=args.residual,
         device=device,
     )
 
@@ -218,15 +231,15 @@ def main() -> None:
     # `texts` already carries the mode-appropriate strings (attribute-only,
     # object-only, or the full phrase), so the CLIP text targets are correct
     # for each head without any further splitting here.
-    def forward_batch(batch_type, patch_tokens, texts):
+    def forward_batch(batch_type, patch_tokens, image_embed, texts):
         with torch.no_grad():
             target_embeds = F.normalize(clip_encoder.get_text_features(texts), dim=-1)  # (B, 768)
         if batch_type == "attr":
-            pred = primitive_heads.forward_attribute(patch_tokens)
+            pred = primitive_heads.forward_attribute(patch_tokens, image_embed)
         elif batch_type == "obj":
-            pred = primitive_heads.forward_object(patch_tokens)
+            pred = primitive_heads.forward_object(patch_tokens, image_embed)
         else:  # "comp" — attr/obj heads run detached inside forward_composition
-            pred = primitive_heads.forward_composition(patch_tokens)
+            pred = primitive_heads.forward_composition(patch_tokens, image_embed)
         return pred, target_embeds
 
     # ── Training loop ─────────────────────────────────────────────────────────
@@ -240,10 +253,13 @@ def main() -> None:
 
             # Step 1 — Visual encoding (frozen, no grad)
             with torch.no_grad():
-                patch_tokens = clip_encoder.get_visual_features(images)   # (B, num_patches, 1024)
+                # (B, num_patches, 1024) and (B, 768) from one backbone pass
+                patch_tokens, image_embed = clip_encoder.get_visual_features(images)
 
             # Step 2 — Route to the head for this batch type + encode targets
-            pred_embeds, target_embeds = forward_batch(batch_type, patch_tokens, texts)
+            pred_embeds, target_embeds = forward_batch(
+                batch_type, patch_tokens, image_embed, texts
+            )
 
             # Step 3 — Bidirectional InfoNCE loss, computed per head
             loss = loss_fn(pred_embeds, target_embeds)
@@ -260,10 +276,23 @@ def main() -> None:
             global_step += 1
 
             if global_step % 10 == 0:
+                # cos(pred, CLIP) is the honest read on how far this head has
+                # moved from zero-shot CLIP: 1.0 = still exactly CLIP. The gate
+                # α alone understates it, since the correction's own norm grows
+                # too. Both are logged — α shows the gate opening, the cosine
+                # shows where the prediction actually ended up.
+                gates = primitive_heads.residual_scales()
+                gate_str = "  ".join(f"a_{k}={v:+.4f}" for k, v in gates.items())
+                if gates:
+                    with torch.no_grad():
+                        clip_cos = (
+                            pred_embeds * F.normalize(image_embed, dim=-1)
+                        ).sum(-1).mean().item()
+                    gate_str += f"  cos_clip={clip_cos:.4f}"
                 logger.info(
-                    "epoch=%d  step=%d  type=%-4s  weighted_loss=%.4f  tau=%.4f",
+                    "epoch=%d  step=%d  type=%-4s  weighted_loss=%.4f  tau=%.4f  %s",
                     epoch + 1, global_step, batch_type,
-                    loss.item(), loss_fn.tau.item(),
+                    loss.item(), loss_fn.tau.item(), gate_str,
                 )
 
             if global_step % 1000 == 0:
@@ -292,9 +321,11 @@ def main() -> None:
 
         with torch.no_grad():
             for images, texts, batch_type in val_loader:
-                images       = images.to(device, non_blocking=True)
-                patch_tokens = clip_encoder.get_visual_features(images)
-                pred_embeds, target_embeds = forward_batch(batch_type, patch_tokens, texts)
+                images = images.to(device, non_blocking=True)
+                patch_tokens, image_embed = clip_encoder.get_visual_features(images)
+                pred_embeds, target_embeds = forward_batch(
+                    batch_type, patch_tokens, image_embed, texts
+                )
                 val_loss_sum[batch_type] += loss_fn(pred_embeds, target_embeds).item()
                 val_steps[batch_type]    += 1
 
